@@ -17,7 +17,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Thiếu DISCORD_TOKEN trong file .env")
 
-DB_PATH = os.getenv("DB_PATH", "/data/pet_game.db")
+DB_PATH = DB_PATH = os.getenv("DB_PATH", "/var/data/pet_game.db")
 GUILD_ID = os.getenv("GUILD_ID")
 
 # ID Thiên Đạo: có thể khai báo nhiều người, ngăn cách bằng dấu phẩy trong file .env
