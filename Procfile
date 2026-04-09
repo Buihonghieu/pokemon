@@ -1,0 +1,1 @@
+worker: python discord_pet_game_bot.py
