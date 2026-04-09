@@ -17,7 +17,17 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Thiếu DISCORD_TOKEN trong file .env")
 
-DB_PATH = os.getenv("DB_PATH", "/mnt/data/pet_game.db")
+DB_BASE = os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("DB_DIR") or "/data"
+DB_PATH = os.path.join(DB_BASE, "pet_game.db")
+
+os.makedirs(DB_BASE, exist_ok=True)
+
+print("DB_BASE =", DB_BASE)
+print("DB_PATH =", DB_PATH)
+
+conn = sqlite3.connect(DB_PATH)
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
 GUILD_ID = os.getenv("GUILD_ID")
 
 # ID Thiên Đạo: có thể khai báo nhiều người, ngăn cách bằng dấu phẩy trong file .env
