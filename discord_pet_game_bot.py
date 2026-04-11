@@ -613,9 +613,9 @@ async def taopet(interaction: discord.Interaction, name: str, species: app_comma
     get_user(interaction.user.id)
     cur.execute("SELECT COUNT(*) AS total FROM pets WHERE owner_id = ?", (interaction.user.id,))
     total = cur.fetchone()["total"]
-    if total >= 3:
+    if total >= 9:
         await interaction.response.send_message(
-            embed=send_error_embed("Ban MVP hien chi cho tao toi da 3 pet moi nguoi."),
+            embed=send_error_embed("Ban hien chi cho tao toi da 9 pet moi nguoi."),
             ephemeral=True,
         )
         return
@@ -1834,10 +1834,8 @@ def render_stat_bar(current: int, maximum: int, length: int = 14, filled: str = 
 
 def team_pet_summary_line(pet, role: str) -> str:
     return (
-        f"{ROLE_LABELS.get(role, role)} • **{pet['name']}**
-"
-        f"HP `{pet['health']}/100` {render_stat_bar(pet['health'], 100, 8)}
-"
+        f"{ROLE_LABELS.get(role, role)} • **{pet['name']}**\n"
+        f"HP `{pet['health']}/100` {render_stat_bar(pet['health'], 100, 8)}\n"
         f"ATK **{pet['atk']}** | DEF **{pet['defense']}** | SPD **{pet['speed']}**"
     )
 
@@ -1854,14 +1852,12 @@ def render_battle_board_embed(attacker_name: str, defender_name: str, left_team:
 
     em.add_field(
         name=f"🟦 Team {attacker_name}",
-        value="
-".join(left_header) if left_header else "Chua xep doi hinh",
+        value="\n".join(left_header) if left_header else "Chua xep doi hinh",
         inline=True,
     )
     em.add_field(
         name=f"🟥 Team {defender_name}",
-        value="
-".join(right_header) if right_header else "Chua xep doi hinh",
+        value="\n".join(right_header) if right_header else "Chua xep doi hinh",
         inline=True,
     )
 
@@ -1973,14 +1969,10 @@ def render_unit_card(unit):
         return "-"
     state = "Song" if unit["alive"] else "Ha guc"
     return (
-        f"{ROLE_LABELS.get(unit['role'], unit['role'])} • **{unit['name']}**
-"
-        f"HP: **{unit['hp']} / {unit['max_hp']}**
-"
-        f"{render_stat_bar(unit['hp'], unit['max_hp'], 10)}
-"
-        f"ATK **{unit['atk']}** | DEF **{unit['defense']}** | SPD **{unit['speed']}**
-"
+        f"{ROLE_LABELS.get(unit['role'], unit['role'])} • **{unit['name']}**\n"
+        f"HP: **{unit['hp']} / {unit['max_hp']}**\n"
+        f"{render_stat_bar(unit['hp'], unit['max_hp'], 10)}\n"
+        f"ATK **{unit['atk']}** | DEF **{unit['defense']}** | SPD **{unit['speed']}**\n"
         f"Trang thai: **{state}**"
     )
 
@@ -1997,8 +1989,7 @@ def render_live_battle_embed(attacker_name: str, defender_name: str, left_units:
         em.add_field(name=f"Ben trai #{i + 1}", value=render_unit_card(lu), inline=True)
         em.add_field(name=f"Ben phai #{i + 1}", value=render_unit_card(ru), inline=True)
 
-    log_text = "
-".join(logs[-8:]) if logs else "Tran dau sap bat dau..."
+    log_text = "\n".join(logs[-8:]) if logs else "Tran dau sap bat dau..."
     em.add_field(name="📜 Nhat ky giao tranh", value=log_text, inline=False)
     return em
 
@@ -2155,14 +2146,10 @@ async def quaypet(interaction: discord.Interaction):
     em = discord.Embed(
         title="🎰 Quay pet thanh cong",
         description=(
-            f"🐾 Ban vua nhan duoc **{template['display_name']}**
-"
-            f"ID pet: **{pet_id}**
-"
-            f"Vai tro: **{ROLE_LABELS.get(template['role'], template['role'])}**
-"
-            f"Pham chat: **{template['rarity']}**
-"
+            f"🐾 Ban vua nhan duoc **{template['display_name']}**\n"
+            f"ID pet: **{pet_id}**\n"
+            f"Vai tro: **{ROLE_LABELS.get(template['role'], template['role'])}**\n"
+            f"Pham chat: **{template['rarity']}**\n"
             f"He: **{template['element']}**"
         ),
         color=0x8E44AD,
@@ -2170,20 +2157,16 @@ async def quaypet(interaction: discord.Interaction):
     em.add_field(
         name="📊 Chi so goc",
         value=(
-            f"HP: **{template['base_hp']}**
-"
-            f"ATK: **{template['base_atk']}**
-"
-            f"DEF: **{template['base_defense']}**
-"
+            f"HP: **{template['base_hp']}**\n"
+            f"ATK: **{template['base_atk']}**\n"
+            f"DEF: **{template['base_defense']}**\n"
             f"SPD: **{template['base_speed']}**"
         ),
         inline=True,
     )
     em.add_field(
         name="✨ Ky nang",
-        value=f"**{template['skill_name'] or 'Chua dat ten'}**
-{template['skill_desc'] or 'Chua co mo ta'}",
+        value=f"**{template['skill_name'] or 'Chua dat ten'}**\n{template['skill_desc'] or 'Chua co mo ta'}",
         inline=True,
     )
     if template["image_url"]:
@@ -2208,6 +2191,15 @@ async def xepdoi(interaction: discord.Interaction, role: app_commands.Choice[str
 
     slot_map = {"dame": 1, "tank": 2, "buff": 3}
     slot_no = slot_map[role.value]
+
+    cur.execute("SELECT slot_no, role FROM user_team WHERE owner_id = ? AND pet_id = ?", (interaction.user.id, pet_id))
+    existing = cur.fetchone()
+    if existing and existing["slot_no"] != slot_no:
+        await interaction.response.send_message(
+            embed=send_error_embed(f"Pet nay da duoc xep o vai tro **{ROLE_LABELS.get(existing['role'], existing['role'])}**. Hay doi pet khac hoac thay the truc tiep o o do."),
+            ephemeral=True,
+        )
+        return
 
     cur.execute(
         """
@@ -2238,12 +2230,9 @@ async def doihinh(interaction: discord.Interaction):
         em.add_field(
             name=f"{ROLE_LABELS.get(row['role'], row['role'])} • {row['name']}",
             value=(
-                f"Pet ID: **{row['pet_id']}**
-"
-                f"Loai: **{species_name_vi(row['species'])}**
-"
-                f"Lv: **{row['level']}** • Power: **{calc_pet_power(row)}**
-"
+                f"Pet ID: **{row['pet_id']}**\n"
+                f"Loai: **{species_name_vi(row['species'])}**\n"
+                f"Lv: **{row['level']}** • Power: **{calc_pet_power(row)}**\n"
                 f"HP view: `{row['health']}/100` {render_stat_bar(row['health'], 100, 8)}"
             ),
             inline=False,
