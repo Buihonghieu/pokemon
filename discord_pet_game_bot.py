@@ -1,6 +1,7 @@
 import os
 import random
 import sqlite3
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -10,37 +11,37 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 # =========================
-# CẤU HÌNH
+# CAU HINH
 # =========================
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
-    raise RuntimeError("Thiếu DISCORD_TOKEN trong file .env")
+    raise RuntimeError("Thieu DISCORD_TOKEN trong file .env")
 
 DB_BASE = os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("DB_DIR") or "/data"
 DB_PATH = os.path.join(DB_BASE, "pet_game.db")
-
 os.makedirs(DB_BASE, exist_ok=True)
 
 print("DB_BASE =", DB_BASE)
 print("DB_PATH =", DB_PATH)
 
-conn = sqlite3.connect(DB_PATH)
+conn = sqlite3.connect(DB_PATH, timeout=30)
 conn.row_factory = sqlite3.Row
 cur = conn.cursor()
+cur.execute("PRAGMA foreign_keys = ON")
 GUILD_ID = os.getenv("GUILD_ID")
 
-# ID Thiên Đạo: có thể khai báo nhiều người, ngăn cách bằng dấu phẩy trong file .env
-# Ví dụ: ADMIN_IDS=123456789,987654321
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()}
+
 
 # =========================
 # DATABASE
 # =========================
-conn = sqlite3.connect(DB_PATH)
-conn.row_factory = sqlite3.Row
-cur = conn.cursor()
+def column_exists(table_name: str, column_name: str) -> bool:
+    cur.execute(f"PRAGMA table_info({table_name})")
+    cols = cur.fetchall()
+    return any(col["name"] == column_name for col in cols)
 
 
 def init_db():
@@ -69,8 +70,8 @@ def init_db():
             name TEXT NOT NULL,
             species TEXT NOT NULL,
             gender TEXT NOT NULL,
-            rarity TEXT NOT NULL DEFAULT 'Thường',
-            element TEXT NOT NULL DEFAULT 'Thường',
+            rarity TEXT NOT NULL DEFAULT 'Thuong',
+            element TEXT NOT NULL DEFAULT 'Thuong',
             level INTEGER NOT NULL DEFAULT 1,
             exp INTEGER NOT NULL DEFAULT 0,
             hp INTEGER NOT NULL DEFAULT 100,
@@ -83,6 +84,7 @@ def init_db():
             bond INTEGER NOT NULL DEFAULT 0,
             last_feed TEXT,
             last_hunt TEXT,
+            last_decay TEXT,
             feed_streak INTEGER NOT NULL DEFAULT 0,
             breed_cd_until TEXT,
             mutated INTEGER NOT NULL DEFAULT 0,
@@ -94,6 +96,9 @@ def init_db():
         )
         """
     )
+
+    if not column_exists("pets", "last_decay"):
+        cur.execute("ALTER TABLE pets ADD COLUMN last_decay TEXT")
 
     cur.execute(
         """
@@ -152,8 +157,9 @@ def init_db():
 
 init_db()
 
+
 # =========================
-# HÀM HỖ TRỢ QUYỀN HẠN / GIAO DIỆN
+# HAM HO TRO QUYEN HAN / GIAO DIEN
 # =========================
 def is_thien_dao(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -168,15 +174,29 @@ def make_embed(title: str, description: str, color: int) -> discord.Embed:
 
 
 def send_error_embed(message: str) -> discord.Embed:
-    return make_embed("❌ Thông báo", message, 0xE74C3C)
+    return make_embed("❌ Thong bao", message, 0xE74C3C)
 
 
 def send_success_embed(message: str) -> discord.Embed:
-    return make_embed("✅ Thành công", message, 0x2ECC71)
+    return make_embed("✅ Thanh cong", message, 0x2ECC71)
 
 
 def send_info_embed(message: str) -> discord.Embed:
-    return make_embed("📢 Thông tin", message, 0x3498DB)
+    return make_embed("📢 Thong tin", message, 0x3498DB)
+
+
+def now_str() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def dt_from_str(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    return datetime.fromisoformat(s)
+
+
+def clamp(value: int, min_value: int, max_value: int) -> int:
+    return max(min_value, min(value, max_value))
 
 
 def log_admin_action(
@@ -197,7 +217,7 @@ def log_admin_action(
 
 
 # =========================
-# DỮ LIỆU MẪU / HẰNG SỐ
+# DU LIEU MAU / HANG SO
 # =========================
 SPECIES_DATA = {
     "cho": {"hp": 110, "atk": 14, "defense": 9, "speed": 9},
@@ -207,16 +227,19 @@ SPECIES_DATA = {
     "cao": {"hp": 100, "atk": 15, "defense": 7, "speed": 12},
 }
 
-ELEMENTS = ["Lửa", "Nước", "Cây", "Điện", "Ánh Sáng", "Bóng Tối"]
+ELEMENTS = ["Lua", "Nuoc", "Cay", "Dien", "Anh Sang", "Bong Toi"]
 CROPS = {
     "co": {"minutes": 5, "yield": (2, 4), "food_value": 10},
     "ngo": {"minutes": 10, "yield": (3, 6), "food_value": 18},
     "carot": {"minutes": 15, "yield": (2, 5), "food_value": 25},
 }
 
+COIN_FRAMES = ["🪙", "✨🪙", "💫🪙", "🪙💫", "✨🪙✨"]
+CARD_FRAMES = ["🂠", "🂠 🂠", "🂠 🂠 🂠"]
+
 
 # =========================
-# PHIÊN XÌ DÁCH TẠM TRONG RAM
+# PHIEN XI DACH TAM TRONG RAM
 # =========================
 class BlackjackSession:
     def __init__(self, user_id: int, bet: int):
@@ -243,18 +266,8 @@ blackjack_sessions: dict[int, BlackjackSession] = {}
 
 
 # =========================
-# HÀM HỖ TRỢ DATABASE / THỜI GIAN
+# HAM HO TRO DATABASE / THOI GIAN
 # =========================
-def now_str() -> str:
-    return datetime.utcnow().isoformat()
-
-
-def dt_from_str(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    return datetime.fromisoformat(s)
-
-
 def get_user(user_id: int):
     cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -305,7 +318,7 @@ def get_inventory_text(owner_id: int) -> str:
     )
     rows = cur.fetchall()
     if not rows:
-        return "Kho đồ trống."
+        return "Kho do trong."
     return "\n".join([f"- {r['item_name']}: {r['quantity']}" for r in rows])
 
 
@@ -373,21 +386,24 @@ def decay_pet_stats(owner_id: int):
     active = get_active_pet(owner_id)
     if not active:
         return
-    now = datetime.utcnow()
-    last_feed = dt_from_str(active["last_feed"])
-    hunger = active["hunger"]
-    mood = active["mood"]
 
-    if last_feed:
-        hours_passed = int((now - last_feed).total_seconds() // 3600)
-        if hours_passed > 0:
-            hunger = max(0, hunger - hours_passed * 4)
-            mood = max(0, mood - hours_passed * 2)
-            cur.execute(
-                "UPDATE pets SET hunger = ?, mood = ? WHERE pet_id = ?",
-                (hunger, mood, active["pet_id"]),
-            )
-            conn.commit()
+    now = datetime.utcnow()
+    last_decay = dt_from_str(active["last_decay"])
+    fallback_time = dt_from_str(active["last_feed"]) or dt_from_str(active["created_at"]) or now
+    base_time = last_decay or fallback_time
+
+    hours_passed = int((now - base_time).total_seconds() // 3600)
+    if hours_passed <= 0:
+        return
+
+    hunger = clamp(active["hunger"] - hours_passed * 4, 0, 100)
+    mood = clamp(active["mood"] - hours_passed * 2, 0, 100)
+
+    cur.execute(
+        "UPDATE pets SET hunger = ?, mood = ?, last_decay = ? WHERE pet_id = ?",
+        (hunger, mood, now_str(), active["pet_id"]),
+    )
+    conn.commit()
 
 
 def bar(value: int, max_value: int = 100, length: int = 10, filled: str = "🟩", empty: str = "⬛") -> str:
@@ -402,22 +418,22 @@ def make_box(title: str, lines: list[str]) -> str:
 
 def rarity_icon(rarity: str) -> str:
     return {
-        "Thường": "⚪",
-        "Hiếm": "🔵",
-        "Quý": "🟣",
-        "Sử Thi": "🟠",
-        "Huyền Thoại": "🟡",
-        "Dị Biến": "✨",
+        "Thuong": "⚪",
+        "Hiem": "🔵",
+        "Quy": "🟣",
+        "Su Thi": "🟠",
+        "Huyen Thoai": "🟡",
+        "Di Bien": "✨",
     }.get(rarity, "⚪")
 
 
 def species_name_vi(species: str) -> str:
     return {
-        "cho": "Chó",
-        "meo": "Mèo",
-        "tho": "Thỏ",
-        "rong": "Rồng",
-        "cao": "Cáo",
+        "cho": "Cho",
+        "meo": "Meo",
+        "tho": "Tho",
+        "rong": "Rong",
+        "cao": "Cao",
     }.get(species, species)
 
 
@@ -434,7 +450,7 @@ def make_pet_embed(pet) -> discord.Embed:
         color=0x6A5ACD,
     )
     em.add_field(
-        name="📊 Chỉ số chiến đấu",
+        name="📊 Chi so chien dau",
         value=(
             f"❤️ HP: **{pet['hp']}**\n"
             f"⚔️ ATK: **{pet['atk']}**\n"
@@ -445,26 +461,32 @@ def make_pet_embed(pet) -> discord.Embed:
         inline=True,
     )
     em.add_field(
-        name="📈 Trạng thái",
+        name="📈 Trang thai",
         value=(
-            f"🍖 Đói: `{bar(pet['hunger'])}` **{pet['hunger']}/100**\n"
-            f"😺 Tâm trạng: `{bar(pet['mood'])}` **{pet['mood']}/100**\n"
-            f"💚 Sức khỏe: `{bar(pet['health'])}` **{pet['health']}/100**\n"
-            f"🤝 Thân thiết: **{pet['bond']}**"
+            f"🍖 Doi: `{bar(pet['hunger'])}` **{pet['hunger']}/100**\n"
+            f"😺 Tam trang: `{bar(pet['mood'])}` **{pet['mood']}/100**\n"
+            f"💚 Suc khoe: `{bar(pet['health'])}` **{pet['health']}/100**\n"
+            f"🤝 Than thiet: **{pet['bond']}**"
         ),
         inline=True,
     )
     em.add_field(
-        name="🧬 Thông tin khác",
+        name="🧬 Thong tin khac",
         value=(
-            f"⭐ Cấp: **{pet['level']}**\n"
-            f"🍽️ Streak ăn: **{pet['feed_streak']}**\n"
-            f"🌀 Đột biến: **{'Có' if pet['mutated'] else 'Chưa'}**\n"
-            f"🌱 Thế hệ: **F{pet['generation']}**"
+            f"⭐ Cap: **{pet['level']}**\n"
+            f"🍽️ Streak an: **{pet['feed_streak']}**\n"
+            f"🌀 Dot bien: **{'Co' if pet['mutated'] else 'Chua'}**\n"
+            f"🌱 The he: **F{pet['generation']}**"
         ),
         inline=False,
     )
-    em.set_footer(text=f"Pet ID: {pet['pet_id']} • Chủ nuôi chăm đúng giờ sẽ mạnh hơn")
+    em.set_footer(text=f"Pet ID: {pet['pet_id']} • Cham dung gio se manh hon")
+    return em
+
+
+def make_coinflip_embed(title: str, description: str, color: int) -> discord.Embed:
+    em = discord.Embed(title=title, description=description, color=color)
+    em.set_footer(text="Van may la mot phan, quan ly xu moi la phan con lai")
     return em
 
 
@@ -482,32 +504,32 @@ async def on_ready():
             guild = discord.Object(id=int(GUILD_ID))
             bot.tree.copy_global_to(guild=guild)
             await bot.tree.sync(guild=guild)
-            print(f"Đã sync slash commands cho guild test {GUILD_ID}")
+            print(f"Da sync slash commands cho guild test {GUILD_ID}")
         else:
             await bot.tree.sync()
-            print("Đã sync slash commands global")
+            print("Da sync slash commands global")
     except Exception as e:
-        print("Lỗi sync:", e)
+        print("Loi sync:", e)
 
-    print(f"Bot đã online: {bot.user}")
+    print(f"Bot da online: {bot.user}")
 
 
 # =========================
 # COMMANDS - ACCOUNT
 # =========================
-@bot.tree.command(name="startgame", description="Bắt đầu chơi game pet")
-async def startgame(interaction: discord.Interaction):
+@bot.tree.command(name="batdau", description="Bat dau choi game pet")
+async def batdau(interaction: discord.Interaction):
     user = get_user(interaction.user.id)
     em = make_embed(
-        "🎮 Bắt đầu hành trình",
-        f"{interaction.user.mention} đã vào game.\n🪙 Xu hiện tại: **{user['coins']}**\n🐾 Dùng `/pet_create` để tạo pet đầu tiên.",
+        "🎮 Bat dau hanh trinh",
+        f"{interaction.user.mention} da vao game.\n🪙 Xu hien tai: **{user['coins']}**\n🐾 Dung `/taopet` de tao pet dau tien.",
         0x5DADE2,
     )
     await interaction.response.send_message(embed=em, ephemeral=True)
 
 
-@bot.tree.command(name="daily", description="Nhận quà mỗi ngày")
-async def daily(interaction: discord.Interaction):
+@bot.tree.command(name="diemdanh", description="Nhan qua moi ngay")
+async def diemdanh(interaction: discord.Interaction):
     user = get_user(interaction.user.id)
     now = datetime.utcnow()
     last_daily = dt_from_str(user["last_daily"])
@@ -517,7 +539,7 @@ async def daily(interaction: discord.Interaction):
         hours, rem = divmod(int(remain.total_seconds()), 3600)
         minutes = rem // 60
         await interaction.response.send_message(
-            embed=send_info_embed(f"Bạn đã nhận daily rồi. Còn {hours}h {minutes}m nữa."),
+            embed=send_info_embed(f"Ban da diem danh roi. Con {hours}h {minutes}m nua."),
             ephemeral=True,
         )
         return
@@ -530,36 +552,36 @@ async def daily(interaction: discord.Interaction):
     conn.commit()
     user_gain_exp(interaction.user.id, 15)
     await interaction.response.send_message(
-        embed=send_success_embed(f"Bạn nhận được **{reward} xu** từ daily."),
+        embed=send_success_embed(f"Ban nhan duoc **{reward} xu** tu diem danh hom nay."),
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="profile", description="Xem hồ sơ của bạn")
-async def profile(interaction: discord.Interaction):
+@bot.tree.command(name="hoso", description="Xem ho so cua ban")
+async def hoso(interaction: discord.Interaction):
     user = get_user(interaction.user.id)
     decay_pet_stats(interaction.user.id)
     pet = get_active_pet(interaction.user.id)
 
     em = discord.Embed(
-        title=f"👤 Hồ sơ người chơi • {interaction.user.display_name}",
-        description="🌟 Quản lý tài sản, pet và kho đồ của bạn",
+        title=f"👤 Ho so nguoi choi • {interaction.user.display_name}",
+        description="🌟 Quan ly tai san, pet va kho do cua ban",
         color=0x2ECC71,
     )
     em.add_field(
-        name="💰 Tài sản",
+        name="💰 Tai san",
         value=(
             f"🪙 Xu: **{user['coins']}**\n"
-            f"💎 Ngọc: **{user['gems']}**\n"
-            f"🎖️ Cấp: **{user['level']}**\n"
+            f"💎 Ngoc: **{user['gems']}**\n"
+            f"🎖️ Cap: **{user['level']}**\n"
             f"📚 EXP: **{user['exp']}**"
         ),
         inline=True,
     )
-    em.add_field(name="🎒 Kho đồ", value=get_inventory_text(interaction.user.id), inline=True)
+    em.add_field(name="🎒 Kho do", value=get_inventory_text(interaction.user.id), inline=True)
     if pet:
         em.add_field(
-            name="🐾 Pet đang dùng",
+            name="🐾 Pet dang dung",
             value=(
                 f"**{pet['name']}** ({species_name_vi(pet['species'])})\n"
                 f"⭐ Lv {pet['level']} • 🔥 Power {calc_pet_power(pet)}\n"
@@ -568,9 +590,9 @@ async def profile(interaction: discord.Interaction):
             inline=False,
         )
     else:
-        em.add_field(name="🐾 Pet đang dùng", value="Chưa có pet hoạt động", inline=False)
+        em.add_field(name="🐾 Pet dang dung", value="Chua co pet hoat dong", inline=False)
 
-    em.set_footer(text="Dùng /pet_list để xem toàn bộ thú cưng")
+    em.set_footer(text="Dung /danhsachpet de xem toan bo thu cung")
     await interaction.response.send_message(embed=em)
 
 
@@ -579,28 +601,29 @@ async def profile(interaction: discord.Interaction):
 # =========================
 @app_commands.choices(
     species=[
-        app_commands.Choice(name="Chó", value="cho"),
-        app_commands.Choice(name="Mèo", value="meo"),
-        app_commands.Choice(name="Thỏ", value="tho"),
-        app_commands.Choice(name="Rồng", value="rong"),
-        app_commands.Choice(name="Cáo", value="cao"),
+        app_commands.Choice(name="Cho", value="cho"),
+        app_commands.Choice(name="Meo", value="meo"),
+        app_commands.Choice(name="Tho", value="tho"),
+        app_commands.Choice(name="Rong", value="rong"),
+        app_commands.Choice(name="Cao", value="cao"),
     ]
 )
-@bot.tree.command(name="pet_create", description="Tạo pet đầu tiên")
-async def pet_create(interaction: discord.Interaction, name: str, species: app_commands.Choice[str]):
+@bot.tree.command(name="taopet", description="Tao pet dau tien")
+async def taopet(interaction: discord.Interaction, name: str, species: app_commands.Choice[str]):
     get_user(interaction.user.id)
     cur.execute("SELECT COUNT(*) AS total FROM pets WHERE owner_id = ?", (interaction.user.id,))
     total = cur.fetchone()["total"]
     if total >= 3:
         await interaction.response.send_message(
-            embed=send_error_embed("Bản MVP hiện chỉ cho tạo tối đa 3 pet mỗi người."),
+            embed=send_error_embed("Ban MVP hien chi cho tao toi da 3 pet moi nguoi."),
             ephemeral=True,
         )
         return
 
     sp = SPECIES_DATA[species.value]
-    gender = random.choice(["Đực", "Cái"])
+    gender = random.choice(["Duc", "Cai"])
     element = random.choice(ELEMENTS)
+    now_text = now_str()
 
     cur.execute(
         """
@@ -608,8 +631,8 @@ async def pet_create(interaction: discord.Interaction, name: str, species: app_c
             owner_id, name, species, gender, element,
             hp, atk, defense, speed,
             hunger, mood, health, bond,
-            is_active, created_at, last_feed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 100, 100, 100, 0, ?, ?, ?)
+            is_active, created_at, last_feed, last_decay
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 100, 100, 100, 0, ?, ?, ?, ?)
         """,
         (
             interaction.user.id,
@@ -622,102 +645,103 @@ async def pet_create(interaction: discord.Interaction, name: str, species: app_c
             sp["defense"],
             sp["speed"],
             1 if total == 0 else 0,
-            now_str(),
-            now_str(),
+            now_text,
+            now_text,
+            now_text,
         ),
     )
     conn.commit()
 
     em = discord.Embed(
-        title="🎉 Tạo pet thành công",
+        title="🎉 Tao pet thanh cong",
         description=(
-            f"╔════ Thú cưng mới ════\n"
-            f"🐾 Tên: **{name}**\n"
-            f"🧩 Loài: **{species.name}**\n"
-            f"🚻 Giới tính: **{gender}**\n"
-            f"🌌 Hệ: **{element}**\n"
+            f"╔════ Thu cung moi ════\n"
+            f"🐾 Ten: **{name}**\n"
+            f"🧩 Loai: **{species.name}**\n"
+            f"🚻 Gioi tinh: **{gender}**\n"
+            f"🌌 He: **{element}**\n"
             f"╚═══════════════"
         ),
         color=0xF1C40F,
     )
     em.add_field(
-        name="📌 Ghi chú",
-        value="🌟 Đây là pet đang hoạt động của bạn." if total == 0 else "Dùng `/pet_setactive` để chọn pet này.",
+        name="📌 Ghi chu",
+        value="🌟 Day la pet dang hoat dong cua ban." if total == 0 else "Dung `/chonpet` de chon pet nay.",
         inline=False,
     )
     await interaction.response.send_message(embed=em)
 
 
-@bot.tree.command(name="pet_list", description="Xem danh sách pet")
-async def pet_list(interaction: discord.Interaction):
+@bot.tree.command(name="danhsachpet", description="Xem danh sach pet")
+async def danhsachpet(interaction: discord.Interaction):
     decay_pet_stats(interaction.user.id)
     cur.execute("SELECT * FROM pets WHERE owner_id = ? ORDER BY pet_id", (interaction.user.id,))
     pets = cur.fetchall()
     if not pets:
         await interaction.response.send_message(
-            embed=send_info_embed("Bạn chưa có pet nào. Dùng `/pet_create` để tạo."),
+            embed=send_info_embed("Ban chua co pet nao. Dung `/taopet` de tao."),
             ephemeral=True,
         )
         return
 
-    em = discord.Embed(title=f"🐾 Pet của {interaction.user.display_name}", color=0x3498DB)
+    em = discord.Embed(title=f"🐾 Pet cua {interaction.user.display_name}", color=0x3498DB)
     for p in pets:
         active_mark = "🌟" if p["is_active"] else ""
         em.add_field(
             name=f"#{p['pet_id']} {active_mark} {p['name']}",
             value=(
-                f"Loài: {species_name_vi(p['species'])} | Lv {p['level']}\n"
+                f"Loai: {species_name_vi(p['species'])} | Lv {p['level']}\n"
                 f"Power: {calc_pet_power(p)}\n"
-                f"Đói: {p['hunger']}/100 | Mood: {p['mood']}/100"
+                f"Doi: {p['hunger']}/100 | Mood: {p['mood']}/100"
             ),
             inline=False,
         )
     await interaction.response.send_message(embed=em)
 
 
-@bot.tree.command(name="pet_info", description="Xem chi tiết pet")
-async def pet_info(interaction: discord.Interaction, pet_id: int):
+@bot.tree.command(name="xempet", description="Xem chi tiet pet")
+async def xempet(interaction: discord.Interaction, pet_id: int):
     decay_pet_stats(interaction.user.id)
     cur.execute("SELECT * FROM pets WHERE owner_id = ? AND pet_id = ?", (interaction.user.id, pet_id))
     pet = cur.fetchone()
     if not pet:
-        await interaction.response.send_message(embed=send_error_embed("Không tìm thấy pet này."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Khong tim thay pet nay."), ephemeral=True)
         return
     await interaction.response.send_message(embed=make_pet_embed(pet))
 
 
-@bot.tree.command(name="pet_setactive", description="Đặt pet đang sử dụng")
-async def pet_setactive(interaction: discord.Interaction, pet_id: int):
+@bot.tree.command(name="chonpet", description="Dat pet dang su dung")
+async def chonpet(interaction: discord.Interaction, pet_id: int):
     cur.execute("SELECT * FROM pets WHERE owner_id = ? AND pet_id = ?", (interaction.user.id, pet_id))
     pet = cur.fetchone()
     if not pet:
-        await interaction.response.send_message(embed=send_error_embed("Không tìm thấy pet đó."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Khong tim thay pet do."), ephemeral=True)
         return
 
     cur.execute("UPDATE pets SET is_active = 0 WHERE owner_id = ?", (interaction.user.id,))
     cur.execute("UPDATE pets SET is_active = 1 WHERE pet_id = ?", (pet_id,))
     conn.commit()
-    await interaction.response.send_message(embed=send_success_embed(f"Đã chọn **{pet['name']}** làm pet hoạt động."))
+    await interaction.response.send_message(embed=send_success_embed(f"Da chon **{pet['name']}** lam pet hoat dong."))
 
 
 @app_commands.choices(
     food=[
-        app_commands.Choice(name="Cỏ", value="co"),
-        app_commands.Choice(name="Ngô", value="ngo"),
-        app_commands.Choice(name="Cà rốt", value="carot"),
+        app_commands.Choice(name="Co", value="co"),
+        app_commands.Choice(name="Ngo", value="ngo"),
+        app_commands.Choice(name="Ca rot", value="carot"),
     ]
 )
-@bot.tree.command(name="pet_feed", description="Cho pet đang hoạt động ăn")
-async def pet_feed(interaction: discord.Interaction, food: app_commands.Choice[str]):
+@bot.tree.command(name="chopetan", description="Cho pet dang hoat dong an")
+async def chopetan(interaction: discord.Interaction, food: app_commands.Choice[str]):
     decay_pet_stats(interaction.user.id)
     pet = get_active_pet(interaction.user.id)
     if not pet:
-        await interaction.response.send_message(embed=send_error_embed("Bạn chưa có pet đang hoạt động."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban chua co pet dang hoat dong."), ephemeral=True)
         return
 
     crop = CROPS[food.value]
     if not remove_item(interaction.user.id, food.value, 1):
-        await interaction.response.send_message(embed=send_error_embed(f"Bạn không có **{food.name}** trong kho."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed(f"Ban khong co **{food.name}** trong kho."), ephemeral=True)
         return
 
     now = datetime.utcnow()
@@ -734,27 +758,27 @@ async def pet_feed(interaction: discord.Interaction, food: app_commands.Choice[s
     streak = pet["feed_streak"] + 1 if good_window else max(0, pet["feed_streak"] - 1)
 
     cur.execute(
-        "UPDATE pets SET hunger = ?, mood = ?, bond = ?, feed_streak = ?, last_feed = ? WHERE pet_id = ?",
-        (hunger, mood, bond, streak, now_str(), pet["pet_id"]),
+        "UPDATE pets SET hunger = ?, mood = ?, bond = ?, feed_streak = ?, last_feed = ?, last_decay = ? WHERE pet_id = ?",
+        (hunger, mood, bond, streak, now_str(), now_str(), pet["pet_id"]),
     )
     conn.commit()
     leveled = pet_gain_exp(pet["pet_id"], 8 if good_window else 4)
 
-    bonus = "⏰ Cho ăn đúng nhịp, pet rất vui!" if good_window else "🍽️ Pet đã được ăn no hơn."
+    bonus = "⏰ Cho an dung nhip, pet rat vui!" if good_window else "🍽️ Pet da duoc an no hon."
     em = discord.Embed(
-        title="🍽️ Cho ăn thành công",
+        title="🍽️ Cho an thanh cong",
         description=(
-            f"╔════ Bữa ăn pet ════\n"
+            f"╔════ Bua an pet ════\n"
             f"🐾 Pet: **{pet['name']}**\n"
-            f"🥕 Thức ăn: **{food.name}**\n"
+            f"🥕 Thuc an: **{food.name}**\n"
             f"🔥 Streak: **{streak}**\n"
             f"╚═══════════════"
         ),
         color=0x58D68D,
     )
-    em.add_field(name="📢 Thông báo", value=bonus, inline=False)
+    em.add_field(name="📢 Thong bao", value=bonus, inline=False)
     if leveled and leveled[0] > 0:
-        em.add_field(name="🎉 Thăng cấp", value=f"Pet lên **{leveled[0]}** cấp • Hiện tại: **Lv {leveled[1]}**", inline=False)
+        em.add_field(name="🎉 Thang cap", value=f"Pet len **{leveled[0]}** cap • Hien tai: **Lv {leveled[1]}**", inline=False)
     await interaction.response.send_message(embed=em)
 
 
@@ -763,13 +787,13 @@ async def pet_feed(interaction: discord.Interaction, food: app_commands.Choice[s
 # =========================
 @app_commands.choices(
     crop=[
-        app_commands.Choice(name="Cỏ", value="co"),
-        app_commands.Choice(name="Ngô", value="ngo"),
-        app_commands.Choice(name="Cà rốt", value="carot"),
+        app_commands.Choice(name="Co", value="co"),
+        app_commands.Choice(name="Ngo", value="ngo"),
+        app_commands.Choice(name="Ca rot", value="carot"),
     ]
 )
-@bot.tree.command(name="farm_plant", description="Trồng lương thực")
-async def farm_plant(interaction: discord.Interaction, crop: app_commands.Choice[str]):
+@bot.tree.command(name="trongcay", description="Trong luong thuc")
+async def trongcay(interaction: discord.Interaction, crop: app_commands.Choice[str]):
     get_user(interaction.user.id)
     cfg = CROPS[crop.value]
     now = datetime.utcnow()
@@ -782,7 +806,7 @@ async def farm_plant(interaction: discord.Interaction, crop: app_commands.Choice
     )
     total = cur.fetchone()["total"]
     if total >= 5:
-        await interaction.response.send_message(embed=send_error_embed("Tối đa 5 ô đang trồng cùng lúc trong bản MVP."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Toi da 5 o dang trong cung luc trong ban MVP."), ephemeral=True)
         return
 
     cur.execute(
@@ -790,18 +814,18 @@ async def farm_plant(interaction: discord.Interaction, crop: app_commands.Choice
         (interaction.user.id, crop.value, now_str(), ready.isoformat(), yield_amount),
     )
     conn.commit()
-    await interaction.response.send_message(embed=send_success_embed(f"Đã trồng **{crop.name}**. Sẽ thu hoạch sau **{cfg['minutes']} phút**."))
+    await interaction.response.send_message(embed=send_success_embed(f"Da trong **{crop.name}**. Se thu hoach sau **{cfg['minutes']} phut**."))
 
 
-@bot.tree.command(name="farm_list", description="Xem các ô trồng")
-async def farm_list(interaction: discord.Interaction):
+@bot.tree.command(name="nongtrai", description="Xem cac o trong")
+async def nongtrai(interaction: discord.Interaction):
     cur.execute(
         "SELECT * FROM farm_plots WHERE owner_id = ? AND harvested = 0 ORDER BY plot_id",
         (interaction.user.id,),
     )
     rows = cur.fetchall()
     if not rows:
-        await interaction.response.send_message(embed=send_info_embed("Bạn chưa trồng gì cả."), ephemeral=True)
+        await interaction.response.send_message(embed=send_info_embed("Ban chua trong gi ca."), ephemeral=True)
         return
 
     now = datetime.utcnow()
@@ -809,17 +833,17 @@ async def farm_list(interaction: discord.Interaction):
     for r in rows:
         ready_at = dt_from_str(r["ready_at"])
         if ready_at <= now:
-            status = "✅ Sẵn sàng"
+            status = "✅ San sang"
         else:
             remain = ready_at - now
             mins = int(remain.total_seconds() // 60) + 1
-            status = f"⏳ Còn khoảng {mins} phút"
-        lines.append(f"Ô #{r['plot_id']} - {r['crop_name']} - {status} - sản lượng {r['yield_amount']}")
+            status = f"⏳ Con khoang {mins} phut"
+        lines.append(f"O #{r['plot_id']} - {r['crop_name']} - {status} - san luong {r['yield_amount']}")
     await interaction.response.send_message(embed=send_info_embed("\n".join(lines)))
 
 
-@bot.tree.command(name="farm_harvest", description="Thu hoạch 1 ô hoặc tất cả")
-async def farm_harvest(interaction: discord.Interaction, plot_id: Optional[int] = None):
+@bot.tree.command(name="thunong", description="Thu hoach 1 o hoac tat ca")
+async def thunong(interaction: discord.Interaction, plot_id: Optional[int] = None):
     now = datetime.utcnow()
     if plot_id is None:
         cur.execute("SELECT * FROM farm_plots WHERE owner_id = ? AND harvested = 0", (interaction.user.id,))
@@ -832,7 +856,7 @@ async def farm_harvest(interaction: discord.Interaction, plot_id: Optional[int] 
         rows = cur.fetchall()
 
     if not rows:
-        await interaction.response.send_message(embed=send_error_embed("Không có ô nào hợp lệ để thu hoạch."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Khong co o nao hop le de thu hoach."), ephemeral=True)
         return
 
     harvested_lines = []
@@ -842,33 +866,33 @@ async def farm_harvest(interaction: discord.Interaction, plot_id: Optional[int] 
         if ready_at and ready_at <= now:
             add_item(interaction.user.id, r["crop_name"], r["yield_amount"])
             cur.execute("UPDATE farm_plots SET harvested = 1 WHERE plot_id = ?", (r["plot_id"],))
-            harvested_lines.append(f"- Ô #{r['plot_id']}: +{r['yield_amount']} {r['crop_name']}")
+            harvested_lines.append(f"- O #{r['plot_id']}: +{r['yield_amount']} {r['crop_name']}")
             total_items += r["yield_amount"]
 
     conn.commit()
     if not harvested_lines:
-        await interaction.response.send_message(embed=send_info_embed("Chưa có ô nào chín để thu hoạch."), ephemeral=True)
+        await interaction.response.send_message(embed=send_info_embed("Chua co o nao chin de thu hoach."), ephemeral=True)
         return
 
     user_gain_exp(interaction.user.id, 5)
     em = discord.Embed(
-        title="🌾 Thu hoạch thành công",
-        description=make_box("Nông trại", harvested_lines),
+        title="🌾 Thu hoach thanh cong",
+        description=make_box("Nong trai", harvested_lines),
         color=0x27AE60,
     )
-    em.add_field(name="📦 Tổng vật phẩm", value=f"**{total_items}**", inline=False)
+    em.add_field(name="📦 Tong vat pham", value=f"**{total_items}**", inline=False)
     await interaction.response.send_message(embed=em)
 
 
 # =========================
 # COMMANDS - HUNT / PK
 # =========================
-@bot.tree.command(name="hunt", description="Dùng pet đang hoạt động đi săn tiền")
-async def hunt(interaction: discord.Interaction):
+@bot.tree.command(name="disan", description="Dung pet dang hoat dong di san tien")
+async def disan(interaction: discord.Interaction):
     decay_pet_stats(interaction.user.id)
     pet = get_active_pet(interaction.user.id)
     if not pet:
-        await interaction.response.send_message(embed=send_error_embed("Bạn chưa có pet đang hoạt động."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban chua co pet dang hoat dong."), ephemeral=True)
         return
 
     last_hunt = dt_from_str(pet["last_hunt"])
@@ -876,7 +900,7 @@ async def hunt(interaction: discord.Interaction):
     if last_hunt and (now - last_hunt) < timedelta(minutes=15):
         remain = timedelta(minutes=15) - (now - last_hunt)
         mins = int(remain.total_seconds() // 60) + 1
-        await interaction.response.send_message(embed=send_info_embed(f"Pet đang mệt, đợi khoảng {mins} phút nữa."), ephemeral=True)
+        await interaction.response.send_message(embed=send_info_embed(f"Pet dang met, doi khoang {mins} phut nua."), ephemeral=True)
         return
 
     power = calc_pet_power(pet)
@@ -886,8 +910,8 @@ async def hunt(interaction: discord.Interaction):
     hunger = max(0, pet["hunger"] - random.randint(6, 12))
     mood = max(0, pet["mood"] - random.randint(3, 8))
     cur.execute(
-        "UPDATE pets SET hunger = ?, mood = ?, last_hunt = ? WHERE pet_id = ?",
-        (hunger, mood, now_str(), pet["pet_id"]),
+        "UPDATE pets SET hunger = ?, mood = ?, last_hunt = ?, last_decay = ? WHERE pet_id = ?",
+        (hunger, mood, now_str(), now_str(), pet["pet_id"]),
     )
 
     if roll <= success_rate:
@@ -902,30 +926,30 @@ async def hunt(interaction: discord.Interaction):
         user_gain_exp(interaction.user.id, 8)
         conn.commit()
         em = discord.Embed(
-            title="🏹 Chuyến săn thành công",
+            title="🏹 Chuyen san thanh cong",
             description=(
-                f"╔════ Kết quả săn ════\n"
+                f"╔════ Ket qua san ════\n"
                 f"🐾 Pet: **{pet['name']}**\n"
-                f"💰 Xu kiếm được: **{coins}**\n"
-                f"🔥 Power hiện tại: **{power}**\n"
+                f"💰 Xu kiem duoc: **{coins}**\n"
+                f"🔥 Power hien tai: **{power}**\n"
                 f"╚═══════════════"
             ),
             color=0x3498DB,
         )
         if extra:
-            em.add_field(name="🎁 Nhặt thêm", value=extra, inline=False)
+            em.add_field(name="🎁 Nhat them", value=extra, inline=False)
         await interaction.response.send_message(embed=em)
     else:
         loss = random.randint(20, 60)
         cur.execute("UPDATE users SET coins = MAX(0, coins - ?) WHERE user_id = ?", (loss, interaction.user.id))
         conn.commit()
         em = discord.Embed(
-            title="💥 Chuyến săn thất bại",
+            title="💥 Chuyen san that bai",
             description=(
-                f"╔════ Kết quả săn ════\n"
+                f"╔════ Ket qua san ════\n"
                 f"🐾 Pet: **{pet['name']}**\n"
-                f"💸 Làm rơi: **{loss} xu**\n"
-                f"😿 Hãy cho pet nghỉ ngơi rồi thử lại\n"
+                f"💸 Lam roi: **{loss} xu**\n"
+                f"😿 Hay cho pet nghi ngoi roi thu lai\n"
                 f"╚═══════════════"
             ),
             color=0xE74C3C,
@@ -933,13 +957,13 @@ async def hunt(interaction: discord.Interaction):
         await interaction.response.send_message(embed=em)
 
 
-@bot.tree.command(name="pk", description="Thách đấu người khác bằng pet đang hoạt động")
-async def pk(interaction: discord.Interaction, user: discord.Member):
+@bot.tree.command(name="thachdau", description="Thach dau nguoi khac bang pet dang hoat dong")
+async def thachdau(interaction: discord.Interaction, user: discord.Member):
     if user.bot:
-        await interaction.response.send_message(embed=send_error_embed("Không thể PK với bot."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Khong the PK voi bot."), ephemeral=True)
         return
     if user.id == interaction.user.id:
-        await interaction.response.send_message(embed=send_error_embed("Không thể PK với chính mình."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Khong the PK voi chinh minh."), ephemeral=True)
         return
 
     decay_pet_stats(interaction.user.id)
@@ -947,10 +971,10 @@ async def pk(interaction: discord.Interaction, user: discord.Member):
     my_pet = get_active_pet(interaction.user.id)
     enemy_pet = get_active_pet(user.id)
     if not my_pet:
-        await interaction.response.send_message(embed=send_error_embed("Bạn chưa có pet đang hoạt động."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban chua co pet dang hoat dong."), ephemeral=True)
         return
     if not enemy_pet:
-        await interaction.response.send_message(embed=send_error_embed("Đối thủ chưa có pet đang hoạt động."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Doi thu chua co pet dang hoat dong."), ephemeral=True)
         return
 
     my_power = calc_pet_power(my_pet) + random.randint(-15, 20)
@@ -960,7 +984,7 @@ async def pk(interaction: discord.Interaction, user: discord.Member):
 
     stake = min(200, my_user["coins"], enemy_user["coins"])
     if stake <= 0:
-        await interaction.response.send_message(embed=send_error_embed("Một trong hai người không đủ xu để PK."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Mot trong hai nguoi khong du xu de PK."), ephemeral=True)
         return
 
     if my_power >= enemy_power:
@@ -985,54 +1009,54 @@ async def pk(interaction: discord.Interaction, user: discord.Member):
     conn.commit()
 
     em = discord.Embed(
-        title="⚔️ Kết quả PK",
+        title="⚔️ Ket qua PK",
         description=(
-            f"╔════ Đấu trường ════\n"
+            f"╔════ Dau truong ════\n"
             f"🟥 {interaction.user.display_name} • {my_pet['name']} • **{my_power}** power\n"
             f"🟦 {user.display_name} • {enemy_pet['name']} • **{enemy_power}** power\n"
             f"╚═══════════════"
         ),
         color=0x9B59B6,
     )
-    em.add_field(name="🏆 Người thắng", value=f"**{winner_name}** cùng pet **{winner_pet}**", inline=False)
-    em.add_field(name="💰 Phần thưởng", value=f"**{stake} xu**", inline=False)
+    em.add_field(name="🏆 Nguoi thang", value=f"**{winner_name}** cung pet **{winner_pet}**", inline=False)
+    em.add_field(name="💰 Phan thuong", value=f"**{stake} xu**", inline=False)
     await interaction.response.send_message(embed=em)
 
 
 # =========================
 # COMMANDS - BREED (MVP BASIC)
 # =========================
-@bot.tree.command(name="breed", description="Phối giống 2 pet của bạn")
-async def breed(interaction: discord.Interaction, pet_a_id: int, pet_b_id: int, child_name: str):
+@bot.tree.command(name="phoigiong", description="Phoi giong 2 pet cua ban")
+async def phoigiong(interaction: discord.Interaction, pet_a_id: int, pet_b_id: int, child_name: str):
     cur.execute("SELECT * FROM pets WHERE owner_id = ? AND pet_id = ?", (interaction.user.id, pet_a_id))
     pet_a = cur.fetchone()
     cur.execute("SELECT * FROM pets WHERE owner_id = ? AND pet_id = ?", (interaction.user.id, pet_b_id))
     pet_b = cur.fetchone()
 
     if not pet_a or not pet_b:
-        await interaction.response.send_message(embed=send_error_embed("Không tìm thấy một trong hai pet."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Khong tim thay mot trong hai pet."), ephemeral=True)
         return
     if pet_a_id == pet_b_id:
-        await interaction.response.send_message(embed=send_error_embed("Phải chọn 2 pet khác nhau."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Phai chon 2 pet khac nhau."), ephemeral=True)
         return
     if pet_a["gender"] == pet_b["gender"]:
-        await interaction.response.send_message(embed=send_error_embed("Hai pet phải khác giới tính."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Hai pet phai khac gioi tinh."), ephemeral=True)
         return
     if pet_a["level"] < 5 or pet_b["level"] < 5:
-        await interaction.response.send_message(embed=send_error_embed("Cả hai pet phải đạt cấp 5 trở lên mới phối giống."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ca hai pet phai dat cap 5 tro len moi phoi giong."), ephemeral=True)
         return
 
     cd_a = dt_from_str(pet_a["breed_cd_until"])
     cd_b = dt_from_str(pet_b["breed_cd_until"])
     now = datetime.utcnow()
     if (cd_a and cd_a > now) or (cd_b and cd_b > now):
-        await interaction.response.send_message(embed=send_info_embed("Một trong hai pet vẫn đang cooldown phối giống."), ephemeral=True)
+        await interaction.response.send_message(embed=send_info_embed("Mot trong hai pet van dang cooldown phoi giong."), ephemeral=True)
         return
 
     user = get_user(interaction.user.id)
     cost = 500
     if user["coins"] < cost:
-        await interaction.response.send_message(embed=send_error_embed("Bạn không đủ 500 xu để phối giống."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban khong du 500 xu de phoi giong."), ephemeral=True)
         return
 
     mutation_rate = 5
@@ -1042,10 +1066,10 @@ async def breed(interaction: discord.Interaction, pet_a_id: int, pet_b_id: int, 
         mutation_rate += 2
 
     mutated = 1 if random.randint(1, 100) <= mutation_rate else 0
-    rarity = "Dị Biến" if mutated else random.choice(["Thường", "Hiếm", "Quý"])
+    rarity = "Di Bien" if mutated else random.choice(["Thuong", "Hiem", "Quy"])
     species = random.choice([pet_a["species"], pet_b["species"]])
     element = random.choice([pet_a["element"], pet_b["element"]])
-    gender = random.choice(["Đực", "Cái"])
+    gender = random.choice(["Duc", "Cai"])
 
     base = SPECIES_DATA.get(species, SPECIES_DATA["cho"])
     hp = int((pet_a["hp"] + pet_b["hp"] + base["hp"]) / 3) + random.randint(-5, 8)
@@ -1053,16 +1077,26 @@ async def breed(interaction: discord.Interaction, pet_a_id: int, pet_b_id: int, 
     defense = int((pet_a["defense"] + pet_b["defense"] + base["defense"]) / 3) + random.randint(-2, 3)
     speed = int((pet_a["speed"] + pet_b["speed"] + base["speed"]) / 3) + random.randint(-2, 3)
 
+    hp = max(50, hp)
+    atk = max(5, atk)
+    defense = max(5, defense)
+    speed = max(5, speed)
+
     cur.execute("UPDATE users SET coins = coins - ? WHERE user_id = ?", (cost, interaction.user.id))
     cd_until = (now + timedelta(hours=12)).isoformat()
     cur.execute("UPDATE pets SET breed_cd_until = ? WHERE pet_id IN (?, ?)", (cd_until, pet_a_id, pet_b_id))
+
+    child_now = now_str()
     cur.execute(
         """
         INSERT INTO pets(
             owner_id, name, species, gender, rarity, element,
-            hp, atk, defense, speed, hunger, mood, health,
-            generation, parent_a, parent_b, mutated, is_active, created_at, last_feed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, 100, 100, ?, ?, ?, ?, 0, ?, ?)
+            level, exp, hp, atk, defense, speed,
+            hunger, mood, health, bond,
+            last_feed, last_decay,
+            feed_streak, breed_cd_until, mutated, generation,
+            parent_a, parent_b, is_active, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             interaction.user.id,
@@ -1071,35 +1105,45 @@ async def breed(interaction: discord.Interaction, pet_a_id: int, pet_b_id: int, 
             gender,
             rarity,
             element,
+            1,
+            0,
             hp,
             atk,
             defense,
             speed,
+            100,
+            100,
+            100,
+            0,
+            child_now,
+            child_now,
+            0,
+            None,
+            mutated,
             max(pet_a["generation"], pet_b["generation"]) + 1,
             pet_a_id,
             pet_b_id,
-            mutated,
-            now_str(),
-            now_str(),
+            0,
+            child_now,
         ),
     )
     conn.commit()
 
     em = discord.Embed(
-        title="🧬 Phối giống thành công",
+        title="🧬 Phoi giong thanh cong",
         description=(
-            f"╔════ Pet con mới ════\n"
-            f"🐣 Tên: **{child_name}**\n"
-            f"🧩 Loài: **{species_name_vi(species)}**\n"
-            f"🚻 Giới tính: **{gender}**\n"
-            f"🌌 Hệ: **{element}**\n"
-            f"{rarity_icon(rarity)} Phẩm chất: **{rarity}**\n"
-            f"💸 Phí phối: **{cost} xu**\n"
+            f"╔════ Pet con moi ════\n"
+            f"🐣 Ten: **{child_name}**\n"
+            f"🧩 Loai: **{species_name_vi(species)}**\n"
+            f"🚻 Gioi tinh: **{gender}**\n"
+            f"🌌 He: **{element}**\n"
+            f"{rarity_icon(rarity)} Pham chat: **{rarity}**\n"
+            f"💸 Phi phoi: **{cost} xu**\n"
             f"╚═══════════════"
         ),
         color=0xFF66CC if mutated else 0xAF7AC5,
     )
-    em.add_field(name="✨ Kết quả dị biến", value="Pet con đã đột biến!" if mutated else "Pet con sinh ra bình thường.", inline=False)
+    em.add_field(name="✨ Ket qua di bien", value="Pet con da dot bien!" if mutated else "Pet con sinh ra binh thuong.", inline=False)
     await interaction.response.send_message(embed=em)
 
 
@@ -1108,40 +1152,54 @@ async def breed(interaction: discord.Interaction, pet_a_id: int, pet_b_id: int, 
 # =========================
 @app_commands.choices(
     side=[
-        app_commands.Choice(name="Ngửa", value="ngua"),
-        app_commands.Choice(name="Sấp", value="sap"),
+        app_commands.Choice(name="Ngua", value="ngua"),
+        app_commands.Choice(name="Sap", value="sap"),
     ]
 )
-@bot.tree.command(name="coinflip", description="Úp ngửa ăn xu")
-async def coinflip(interaction: discord.Interaction, bet: int, side: app_commands.Choice[str]):
+@bot.tree.command(name="upngua", description="Tung dong xu an xu")
+async def upngua(interaction: discord.Interaction, bet: int, side: app_commands.Choice[str]):
     user = get_user(interaction.user.id)
     if bet <= 0:
-        await interaction.response.send_message(embed=send_error_embed("Tiền cược phải > 0."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Tien cuoc phai > 0."), ephemeral=True)
         return
     if user["coins"] < bet:
-        await interaction.response.send_message(embed=send_error_embed("Bạn không đủ xu."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban khong du xu."), ephemeral=True)
         return
 
+    cur.execute("UPDATE users SET coins = coins - ? WHERE user_id = ?", (bet, interaction.user.id))
+    conn.commit()
+
+    await interaction.response.defer()
+    for i, frame in enumerate(COIN_FRAMES[:4], start=1):
+        em = make_coinflip_embed(
+            "🪙 Dang tung dong xu",
+            f"{frame}\n\nBan chon: **{side.name}**\nTien cuoc: **{bet} xu**\n\nLan xoay thu **{i}**...",
+            0xF1C40F,
+        )
+        await interaction.edit_original_response(embed=em)
+        await asyncio.sleep(0.45)
+
     result = random.choice(["ngua", "sap"])
+    result_name = "Ngua" if result == "ngua" else "Sap"
+
     if result == side.value:
-        win = int(bet * 0.95)
-        cur.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (win, interaction.user.id))
+        profit = int(bet * 0.95)
+        total_return = bet + profit
+        cur.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (total_return, interaction.user.id))
         conn.commit()
-        em = discord.Embed(
-            title="🪙 Coinflip chiến thắng",
-            description=make_box("Kết quả", [f"Lựa chọn: **{side.name}**", f"Tiền thắng: **{win} xu**"]),
-            color=0x2ECC71,
+        em = make_coinflip_embed(
+            "🎉 Up ngua chien thang",
+            f"{COIN_FRAMES[-1]}\n\nRa mat: **{result_name}**\nBan thang rong: **{profit} xu**\nTien hoan ca cuoc: **{total_return} xu**",
+            0x2ECC71,
         )
-        await interaction.response.send_message(embed=em)
+        await interaction.edit_original_response(embed=em)
     else:
-        cur.execute("UPDATE users SET coins = coins - ? WHERE user_id = ?", (bet, interaction.user.id))
-        conn.commit()
-        em = discord.Embed(
-            title="🪙 Coinflip thất bại",
-            description=make_box("Kết quả", [f"Ra mặt: **{'Ngửa' if result == 'ngua' else 'Sấp'}**", f"Tiền thua: **{bet} xu**"]),
-            color=0xE74C3C,
+        em = make_coinflip_embed(
+            "💸 Up ngua that bai",
+            f"{COIN_FRAMES[-1]}\n\nRa mat: **{result_name}**\nBan mat: **{bet} xu**",
+            0xE74C3C,
         )
-        await interaction.response.send_message(embed=em)
+        await interaction.edit_original_response(embed=em)
 
 
 class BlackjackView(discord.ui.View):
@@ -1149,37 +1207,46 @@ class BlackjackView(discord.ui.View):
         super().__init__(timeout=120)
         self.owner_id = owner_id
 
-    def make_blackjack_embed(self, session: BlackjackSession, reveal_dealer: bool = False, result_text: Optional[str] = None) -> discord.Embed:
+    def make_blackjack_embed(self, session: BlackjackSession, reveal_dealer: bool = False, result_text: Optional[str] = None, animation_text: Optional[str] = None) -> discord.Embed:
         player_score = session.score(session.player)
         dealer_score = session.score(session.dealer)
         dealer_cards = str(session.dealer) if reveal_dealer else f"[{session.dealer[0]}, ?]"
         dealer_value = f"**{dealer_score}**" if reveal_dealer else "?"
 
         em = discord.Embed(
-            title="🃏 Bàn Xì Dách",
-            description="Khung giải trí đỏ đen dùng xu trong game.",
+            title="🃏 Ban Xi Dach",
+            description="Khung giai tri do den dung xu trong game.",
             color=0x1ABC9C,
         )
-        em.add_field(name="🎴 Bài của bạn", value=f"{session.player}\nTổng điểm: **{player_score}**", inline=True)
-        em.add_field(name="🏦 Bài nhà cái", value=f"{dealer_cards}\nTổng điểm: {dealer_value}", inline=True)
-        em.add_field(name="💰 Tiền cược", value=f"**{session.bet} xu**", inline=False)
+        if animation_text:
+            em.add_field(name="🎬 Hoat canh", value=animation_text, inline=False)
+        em.add_field(name="🎴 Bai cua ban", value=f"{session.player}\nTong diem: **{player_score}**", inline=True)
+        em.add_field(name="🏦 Bai nha cai", value=f"{dealer_cards}\nTong diem: {dealer_value}", inline=True)
+        em.add_field(name="💰 Tien cuoc", value=f"**{session.bet} xu**", inline=False)
         if result_text:
-            em.add_field(name="📢 Kết quả", value=result_text, inline=False)
-        em.set_footer(text="Rút để lấy thêm bài • Dằn để so điểm với nhà cái")
+            em.add_field(name="📢 Ket qua", value=result_text, inline=False)
+        em.set_footer(text="Rut de lay them bai • Dan de so diem voi nha cai")
         return em
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("Đây không phải bàn xì dách của bạn.", ephemeral=True)
+            await interaction.response.send_message("Day khong phai ban xi dach cua ban.", ephemeral=True)
             return False
         return True
 
-    @discord.ui.button(label="Rút", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Rut", style=discord.ButtonStyle.primary)
     async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
         session = blackjack_sessions.get(self.owner_id)
         if not session or session.finished:
-            await interaction.response.send_message("Ván này đã kết thúc.", ephemeral=True)
+            await interaction.response.send_message("Van nay da ket thuc.", ephemeral=True)
             return
+
+        await interaction.response.defer()
+        await interaction.message.edit(
+            embed=self.make_blackjack_embed(session, reveal_dealer=False, result_text="Ban dang rut them 1 la bai...", animation_text="🂠 ➜ ✨"),
+            view=self,
+        )
+        await asyncio.sleep(0.55)
 
         session.player.append(session.draw())
         player_score = session.score(session.player)
@@ -1187,108 +1254,148 @@ class BlackjackView(discord.ui.View):
         if player_score > 21:
             session.finished = True
             cur.execute(
-                "UPDATE users SET coins = coins - ?, blackjack_losses = blackjack_losses + 1 WHERE user_id = ?",
-                (session.bet, self.owner_id),
+                "UPDATE users SET blackjack_losses = blackjack_losses + 1 WHERE user_id = ?",
+                (self.owner_id,),
             )
             conn.commit()
             self.disable_all_items()
-            await interaction.response.edit_message(
-                embed=self.make_blackjack_embed(session, reveal_dealer=True, result_text=f"💥 Quắc! Bạn thua **{session.bet} xu**."),
+            await interaction.message.edit(
+                embed=self.make_blackjack_embed(session, reveal_dealer=True, result_text=f"💥 Quac! Ban thua **{session.bet} xu**.", animation_text="🂠 ... Boom!"),
                 view=self,
             )
+            blackjack_sessions.pop(self.owner_id, None)
             return
 
-        await interaction.response.edit_message(
-            embed=self.make_blackjack_embed(session, reveal_dealer=False, result_text="Bạn vẫn có thể rút hoặc dằn."),
+        await interaction.message.edit(
+            embed=self.make_blackjack_embed(session, reveal_dealer=False, result_text="Ban van co the rut hoac dan.", animation_text="✨ Them 1 la bai moi vua duoc chia"),
             view=self,
         )
 
-    @discord.ui.button(label="Dằn", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Dan", style=discord.ButtonStyle.success)
     async def stand(self, interaction: discord.Interaction, button: discord.ui.Button):
         session = blackjack_sessions.get(self.owner_id)
         if not session or session.finished:
-            await interaction.response.send_message("Ván này đã kết thúc.", ephemeral=True)
+            await interaction.response.send_message("Van nay da ket thuc.", ephemeral=True)
             return
 
+        await interaction.response.defer()
         session.finished = True
+
+        await interaction.message.edit(
+            embed=self.make_blackjack_embed(session, reveal_dealer=True, result_text="Nha cai dang mo bai...", animation_text="🂠🂠 ➜ 🃏"),
+            view=self,
+        )
+        await asyncio.sleep(0.7)
+
         while session.score(session.dealer) < 17:
             session.dealer.append(session.draw())
+            await interaction.message.edit(
+                embed=self.make_blackjack_embed(session, reveal_dealer=True, result_text="Nha cai dang rut them bai...", animation_text="🏦 Rut them 1 la bai"),
+                view=self,
+            )
+            await asyncio.sleep(0.55)
 
         player_score = session.score(session.player)
         dealer_score = session.score(session.dealer)
 
         if dealer_score > 21 or player_score > dealer_score:
-            win = int(session.bet * 1.5)
+            total_return = session.bet * 2
             cur.execute(
                 "UPDATE users SET coins = coins + ?, blackjack_wins = blackjack_wins + 1 WHERE user_id = ?",
-                (win, self.owner_id),
+                (total_return, self.owner_id),
             )
-            result_text = f"🎉 Bạn thắng **{win} xu**."
+            result_text = f"🎉 Ban thang! Hoan cuoc va tien thuong: **{total_return} xu**."
         elif player_score == dealer_score:
-            result_text = "🤝 Hòa, không mất xu."
-        else:
             cur.execute(
-                "UPDATE users SET coins = coins - ?, blackjack_losses = blackjack_losses + 1 WHERE user_id = ?",
+                "UPDATE users SET coins = coins + ? WHERE user_id = ?",
                 (session.bet, self.owner_id),
             )
-            result_text = f"💸 Bạn thua **{session.bet} xu**."
+            result_text = f"🤝 Hoa, nha cai hoan lai **{session.bet} xu** cho ban."
+        else:
+            cur.execute(
+                "UPDATE users SET blackjack_losses = blackjack_losses + 1 WHERE user_id = ?",
+                (self.owner_id,),
+            )
+            result_text = f"💸 Ban thua **{session.bet} xu**."
 
         conn.commit()
         self.disable_all_items()
-        await interaction.response.edit_message(
-            embed=self.make_blackjack_embed(session, reveal_dealer=True, result_text=result_text),
+        await interaction.message.edit(
+            embed=self.make_blackjack_embed(session, reveal_dealer=True, result_text=result_text, animation_text="🎬 Van bai da ha man"),
             view=self,
         )
+        blackjack_sessions.pop(self.owner_id, None)
+
+    async def on_timeout(self):
+        session = blackjack_sessions.get(self.owner_id)
+        if session and not session.finished:
+            blackjack_sessions.pop(self.owner_id, None)
+        self.disable_all_items()
 
 
-@bot.tree.command(name="blackjack", description="Chơi xì dách")
-async def blackjack(interaction: discord.Interaction, bet: int):
+@bot.tree.command(name="xidach", description="Choi xi dach")
+async def xidach(interaction: discord.Interaction, bet: int):
     user = get_user(interaction.user.id)
     if bet <= 0:
-        await interaction.response.send_message(embed=send_error_embed("Tiền cược phải > 0."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Tien cuoc phai > 0."), ephemeral=True)
         return
     if user["coins"] < bet:
-        await interaction.response.send_message(embed=send_error_embed("Bạn không đủ xu."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban khong du xu."), ephemeral=True)
         return
+    if interaction.user.id in blackjack_sessions:
+        await interaction.response.send_message(embed=send_error_embed("Ban dang co 1 van xi dach chua ket thuc."), ephemeral=True)
+        return
+
+    cur.execute("UPDATE users SET coins = coins - ? WHERE user_id = ?", (bet, interaction.user.id))
+    conn.commit()
 
     session = BlackjackSession(interaction.user.id, bet)
     blackjack_sessions[interaction.user.id] = session
+
+    await interaction.response.defer(ephemeral=True)
+    for frame in CARD_FRAMES:
+        em = discord.Embed(title="🃏 Dang chia bai", description="Ban bai dang duoc sap xep...", color=0x16A085)
+        em.add_field(name="🎬 Hoat canh", value=f"{frame}\nNha cai dang chia bai...", inline=False)
+        em.add_field(name="💰 Tien cuoc", value=f"**{bet} xu**", inline=False)
+        await interaction.edit_original_response(embed=em, view=None)
+        await asyncio.sleep(0.5)
+
     player_score = session.score(session.player)
 
     if player_score == 21:
-        win = int(bet * 2)
+        total_return = int(bet * 2.5)
         cur.execute(
             "UPDATE users SET coins = coins + ?, blackjack_wins = blackjack_wins + 1 WHERE user_id = ?",
-            (win, interaction.user.id),
+            (total_return, interaction.user.id),
         )
         conn.commit()
-        em = discord.Embed(title="🃏 Blackjack!", description="Bạn rút được 21 ngay từ đầu.", color=0x16A085)
-        em.add_field(name="🎴 Bài của bạn", value=str(session.player), inline=False)
-        em.add_field(name="💰 Tiền thắng", value=f"**{win} xu**", inline=False)
-        await interaction.response.send_message(embed=em)
+        em = discord.Embed(title="🃏 Blackjack!", description="Ban rut duoc 21 ngay tu dau.", color=0x16A085)
+        em.add_field(name="🎴 Bai cua ban", value=str(session.player), inline=False)
+        em.add_field(name="💰 Tien nhan", value=f"**{total_return} xu**", inline=False)
+        await interaction.edit_original_response(embed=em, view=None)
+        blackjack_sessions.pop(interaction.user.id, None)
         return
 
     view = BlackjackView(interaction.user.id)
-    await interaction.response.send_message(
-        embed=view.make_blackjack_embed(session, reveal_dealer=False, result_text="Chọn rút hoặc dằn."),
+    await interaction.edit_original_response(
+        embed=view.make_blackjack_embed(session, reveal_dealer=False, result_text="Chon rut hoac dan.", animation_text="✨ Bai da chia xong"),
         view=view,
-        ephemeral=True,
     )
 
 
 # =========================
 # COMMANDS - LEADERBOARD
 # =========================
-@bot.tree.command(name="top_coins", description="Top người chơi giàu nhất")
-async def top_coins(interaction: discord.Interaction):
+@bot.tree.command(name="topxu", description="Top nguoi choi giau nhat")
+async def topxu(interaction: discord.Interaction):
     cur.execute("SELECT user_id, coins, level FROM users ORDER BY coins DESC LIMIT 10")
     rows = cur.fetchall()
     if not rows:
-        await interaction.response.send_message(embed=send_info_embed("Chưa có dữ liệu."), ephemeral=True)
+        await interaction.response.send_message(embed=send_info_embed("Chua co du lieu."), ephemeral=True)
         return
 
     medals = ["🥇", "🥈", "🥉"]
-    em = discord.Embed(title="🏆 Bảng Xếp Hạng Xu", description="Top 10 người chơi giàu nhất hiện tại", color=0xF1C40F)
+    em = discord.Embed(title="🏆 Bang Xep Hang Xu", description="Top 10 nguoi choi giau nhat hien tai", color=0xF1C40F)
     text_lines = []
     for i, row in enumerate(rows, start=1):
         user = interaction.guild.get_member(row["user_id"]) if interaction.guild else None
@@ -1296,116 +1403,116 @@ async def top_coins(interaction: discord.Interaction):
         medal = medals[i - 1] if i <= 3 else f"`#{i}`"
         text_lines.append(f"{medal} **{name}** • 🪙 {row['coins']} • 🎖️ Lv {row['level']}")
     em.add_field(name="📜 BXH", value="\n".join(text_lines), inline=False)
-    em.set_footer(text="Chơi chăm để leo top và nhận thưởng")
+    em.set_footer(text="Choi cham de leo top va nhan thuong")
     await interaction.response.send_message(embed=em)
 
 
-@bot.tree.command(name="top_pets", description="Top pet mạnh nhất")
-async def top_pets(interaction: discord.Interaction):
+@bot.tree.command(name="toppet", description="Top pet manh nhat")
+async def toppet(interaction: discord.Interaction):
     cur.execute("SELECT * FROM pets ORDER BY level DESC, atk DESC, hp DESC LIMIT 10")
     rows = cur.fetchall()
     if not rows:
-        await interaction.response.send_message(embed=send_info_embed("Chưa có pet nào."), ephemeral=True)
+        await interaction.response.send_message(embed=send_info_embed("Chua co pet nao."), ephemeral=True)
         return
 
     medals = ["🥇", "🥈", "🥉"]
-    em = discord.Embed(title="🐾 Bảng Xếp Hạng Pet", description="Top 10 pet mạnh nhất máy chủ", color=0x9B59B6)
+    em = discord.Embed(title="🐾 Bang Xep Hang Pet", description="Top 10 pet manh nhat may chu", color=0x9B59B6)
     text_lines = []
     for i, pet in enumerate(rows, start=1):
         user = interaction.guild.get_member(pet["owner_id"]) if interaction.guild else None
         owner_name = user.display_name if user else f"User {pet['owner_id']}"
         medal = medals[i - 1] if i <= 3 else f"`#{i}`"
         text_lines.append(
-            f"{medal} **{pet['name']}** ({species_name_vi(pet['species'])}) • ⭐ Lv {pet['level']} • 🔥 {calc_pet_power(pet)} • Chủ: **{owner_name}**"
+            f"{medal} **{pet['name']}** ({species_name_vi(pet['species'])}) • ⭐ Lv {pet['level']} • 🔥 {calc_pet_power(pet)} • Chu: **{owner_name}**"
         )
     em.add_field(name="📜 BXH", value="\n".join(text_lines), inline=False)
-    em.set_footer(text="Pet khỏe, chăm đúng giờ và lai tạo tốt sẽ leo top nhanh")
+    em.set_footer(text="Pet khoe, cham dung gio va lai tao tot se leo top nhanh")
     await interaction.response.send_message(embed=em)
 
 
 # =========================
-# THIÊN ĐẠO / ADMIN
+# THIEN DAO / ADMIN
 # =========================
-@bot.tree.command(name="thien_dao_help", description="Xem các lệnh Thiên Đạo")
-async def thien_dao_help(interaction: discord.Interaction):
+@bot.tree.command(name="thiendaohelp", description="Xem cac lenh Thien Dao")
+async def thiendaohelp(interaction: discord.Interaction):
     if not require_thien_dao(interaction):
-        await interaction.response.send_message(embed=send_error_embed("Bạn không có quyền Thiên Đạo."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban khong co quyen Thien Dao."), ephemeral=True)
         return
 
     em = make_embed(
-        "👑 Bảng lệnh Thiên Đạo",
-        "Các lệnh quản trị và ban phát quyền năng trong game.",
+        "👑 Bang lenh Thien Dao",
+        "Cac lenh quan tri va ban phat quyen nang trong game.",
         0xF4D03F,
     )
-    em.add_field(name="🪙 Kinh tế", value="`/admin_give_coin`\n`/admin_set_coin`", inline=True)
-    em.add_field(name="🐾 Pet", value="`/admin_set_pet_stat`\n`/admin_heal_pet`", inline=True)
-    em.add_field(name="🎁 Vật phẩm", value="`/admin_give_item`", inline=True)
-    em.add_field(name="📚 Nhật ký", value="`/admin_logs_view`", inline=True)
-    em.add_field(name="📢 Khác", value="`/thien_dao_help`", inline=False)
+    em.add_field(name="🪙 Kinh te", value="`/choxu`\n`/setxu`", inline=True)
+    em.add_field(name="🐾 Pet", value="`/suapet`\n`/hoipet`", inline=True)
+    em.add_field(name="🎁 Vat pham", value="`/chovatpham`", inline=True)
+    em.add_field(name="📚 Nhat ky", value="`/nhatkythiendao`", inline=True)
+    em.add_field(name="📢 Khac", value="`/thiendaohelp`", inline=False)
     await interaction.response.send_message(embed=em, ephemeral=True)
 
 
-@bot.tree.command(name="admin_give_coin", description="[Thiên Đạo] Ban phát xu cho người chơi")
-async def admin_give_coin(interaction: discord.Interaction, user: discord.Member, coins: int):
+@bot.tree.command(name="choxu", description="[Thien Dao] Ban phat xu cho nguoi choi")
+async def choxu(interaction: discord.Interaction, user: discord.Member, coins: int):
     if not require_thien_dao(interaction):
-        await interaction.response.send_message(embed=send_error_embed("Bạn không có quyền Thiên Đạo."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban khong co quyen Thien Dao."), ephemeral=True)
         return
     if coins <= 0:
-        await interaction.response.send_message(embed=send_error_embed("Số xu phải lớn hơn 0."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("So xu phai lon hon 0."), ephemeral=True)
         return
     get_user(user.id)
     cur.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (coins, user.id))
     conn.commit()
     log_admin_action(interaction.user.id, "give_coin", target_user_id=user.id, details=f"+{coins} coins")
-    em = make_embed("👑 Thiên Đạo ban phát", f"Đã cộng **{coins} xu** cho {user.mention}.", 0xF1C40F)
+    em = make_embed("👑 Thien Dao ban phat", f"Da cong **{coins} xu** cho {user.mention}.", 0xF1C40F)
     await interaction.response.send_message(embed=em)
 
 
-@bot.tree.command(name="admin_set_coin", description="[Thiên Đạo] Đặt số xu cho người chơi")
-async def admin_set_coin(interaction: discord.Interaction, user: discord.Member, coins: int):
+@bot.tree.command(name="setxu", description="[Thien Dao] Dat so xu cho nguoi choi")
+async def setxu(interaction: discord.Interaction, user: discord.Member, coins: int):
     if not require_thien_dao(interaction):
-        await interaction.response.send_message(embed=send_error_embed("Bạn không có quyền Thiên Đạo."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban khong co quyen Thien Dao."), ephemeral=True)
         return
     if coins < 0:
-        await interaction.response.send_message(embed=send_error_embed("Số xu không được âm."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("So xu khong duoc am."), ephemeral=True)
         return
     get_user(user.id)
     cur.execute("UPDATE users SET coins = ? WHERE user_id = ?", (coins, user.id))
     conn.commit()
     log_admin_action(interaction.user.id, "set_coin", target_user_id=user.id, details=f"set to {coins}")
-    em = make_embed("⚖️ Thiên Đạo định mệnh", f"Đã đặt xu của {user.mention} thành **{coins}**.", 0xF39C12)
+    em = make_embed("⚖️ Thien Dao dinh menh", f"Da dat xu cua {user.mention} thanh **{coins}**.", 0xF39C12)
     await interaction.response.send_message(embed=em)
 
 
-@bot.tree.command(name="admin_give_item", description="[Thiên Đạo] Ban phát vật phẩm")
-async def admin_give_item(interaction: discord.Interaction, user: discord.Member, item_name: str, amount: int):
+@bot.tree.command(name="chovatpham", description="[Thien Dao] Ban phat vat pham")
+async def chovatpham(interaction: discord.Interaction, user: discord.Member, item_name: str, amount: int):
     if not require_thien_dao(interaction):
-        await interaction.response.send_message(embed=send_error_embed("Bạn không có quyền Thiên Đạo."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban khong co quyen Thien Dao."), ephemeral=True)
         return
     if amount <= 0:
-        await interaction.response.send_message(embed=send_error_embed("Số lượng phải lớn hơn 0."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("So luong phai lon hon 0."), ephemeral=True)
         return
     get_user(user.id)
     add_item(user.id, item_name.lower(), amount)
     log_admin_action(interaction.user.id, "give_item", target_user_id=user.id, details=f"{item_name} x{amount}")
-    em = make_embed("🎁 Ban phát vật phẩm", f"Đã trao **{amount} {item_name}** cho {user.mention}.", 0x8E44AD)
+    em = make_embed("🎁 Ban phat vat pham", f"Da trao **{amount} {item_name}** cho {user.mention}.", 0x8E44AD)
     await interaction.response.send_message(embed=em)
 
 
-@bot.tree.command(name="admin_heal_pet", description="[Thiên Đạo] Hồi phục pet")
-async def admin_heal_pet(interaction: discord.Interaction, owner: discord.Member, pet_id: int):
+@bot.tree.command(name="hoipet", description="[Thien Dao] Hoi phuc pet")
+async def hoipet(interaction: discord.Interaction, owner: discord.Member, pet_id: int):
     if not require_thien_dao(interaction):
-        await interaction.response.send_message(embed=send_error_embed("Bạn không có quyền Thiên Đạo."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban khong co quyen Thien Dao."), ephemeral=True)
         return
     cur.execute("SELECT * FROM pets WHERE owner_id = ? AND pet_id = ?", (owner.id, pet_id))
     pet = cur.fetchone()
     if not pet:
-        await interaction.response.send_message(embed=send_error_embed("Không tìm thấy pet cần hồi phục."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Khong tim thay pet can hoi phuc."), ephemeral=True)
         return
-    cur.execute("UPDATE pets SET hunger = 100, mood = 100, health = 100 WHERE pet_id = ?", (pet_id,))
+    cur.execute("UPDATE pets SET hunger = 100, mood = 100, health = 100, last_decay = ? WHERE pet_id = ?", (now_str(), pet_id))
     conn.commit()
     log_admin_action(interaction.user.id, "heal_pet", target_user_id=owner.id, target_pet_id=pet_id, details="full restore")
-    em = make_embed("💚 Thiên Đạo hồi phục", f"Đã hồi đầy trạng thái cho pet **{pet['name']}** của {owner.mention}.", 0x58D68D)
+    em = make_embed("💚 Thien Dao hoi phuc", f"Da hoi day trang thai cho pet **{pet['name']}** cua {owner.mention}.", 0x58D68D)
     await interaction.response.send_message(embed=em)
 
 
@@ -1422,8 +1529,8 @@ async def admin_heal_pet(interaction: discord.Interaction, owner: discord.Member
         app_commands.Choice(name="Level", value="level"),
     ]
 )
-@bot.tree.command(name="admin_set_pet_stat", description="[Thiên Đạo] Chỉnh chỉ số pet")
-async def admin_set_pet_stat(
+@bot.tree.command(name="suapet", description="[Thien Dao] Chinh chi so pet")
+async def suapet(
     interaction: discord.Interaction,
     owner: discord.Member,
     pet_id: int,
@@ -1431,42 +1538,56 @@ async def admin_set_pet_stat(
     value: int,
 ):
     if not require_thien_dao(interaction):
-        await interaction.response.send_message(embed=send_error_embed("Bạn không có quyền Thiên Đạo."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban khong co quyen Thien Dao."), ephemeral=True)
         return
 
     allowed_stats = {"hp", "atk", "defense", "speed", "hunger", "mood", "health", "bond", "level"}
     if stat.value not in allowed_stats:
-        await interaction.response.send_message(embed=send_error_embed("Chỉ số không hợp lệ."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Chi so khong hop le."), ephemeral=True)
         return
 
     cur.execute("SELECT * FROM pets WHERE owner_id = ? AND pet_id = ?", (owner.id, pet_id))
     pet = cur.fetchone()
     if not pet:
-        await interaction.response.send_message(embed=send_error_embed("Không tìm thấy pet cần chỉnh."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Khong tim thay pet can chinh."), ephemeral=True)
         return
 
-    cur.execute(f"UPDATE pets SET {stat.value} = ? WHERE pet_id = ?", (value, pet_id))
+    limits = {
+        "hp": (1, 9999),
+        "atk": (1, 999),
+        "defense": (1, 999),
+        "speed": (1, 999),
+        "hunger": (0, 100),
+        "mood": (0, 100),
+        "health": (0, 100),
+        "bond": (0, 9999),
+        "level": (1, 999),
+    }
+    min_v, max_v = limits[stat.value]
+    safe_value = clamp(value, min_v, max_v)
+
+    cur.execute(f"UPDATE pets SET {stat.value} = ? WHERE pet_id = ?", (safe_value, pet_id))
     conn.commit()
-    log_admin_action(interaction.user.id, "set_pet_stat", target_user_id=owner.id, target_pet_id=pet_id, details=f"{stat.value}={value}")
+    log_admin_action(interaction.user.id, "set_pet_stat", target_user_id=owner.id, target_pet_id=pet_id, details=f"{stat.value}={safe_value}")
     em = make_embed(
-        "🛠️ Thiên Đạo chỉnh sửa",
-        f"Đã chỉnh **{stat.name}** của pet **{pet['name']}** thành **{value}**.",
+        "🛠️ Thien Dao chinh sua",
+        f"Da chinh **{stat.name}** cua pet **{pet['name']}** thanh **{safe_value}**.",
         0xEB984E,
     )
     await interaction.response.send_message(embed=em)
 
 
-@bot.tree.command(name="admin_logs_view", description="[Thiên Đạo] Xem nhật ký admin gần nhất")
-async def admin_logs_view(interaction: discord.Interaction, limit: Optional[int] = 10):
+@bot.tree.command(name="nhatkythiendao", description="[Thien Dao] Xem nhat ky admin gan nhat")
+async def nhatkythiendao(interaction: discord.Interaction, limit: Optional[int] = 10):
     if not require_thien_dao(interaction):
-        await interaction.response.send_message(embed=send_error_embed("Bạn không có quyền Thiên Đạo."), ephemeral=True)
+        await interaction.response.send_message(embed=send_error_embed("Ban khong co quyen Thien Dao."), ephemeral=True)
         return
 
     limit = max(1, min(limit or 10, 20))
     cur.execute("SELECT * FROM admin_logs ORDER BY log_id DESC LIMIT ?", (limit,))
     rows = cur.fetchall()
     if not rows:
-        await interaction.response.send_message(embed=send_info_embed("Chưa có nhật ký Thiên Đạo nào."), ephemeral=True)
+        await interaction.response.send_message(embed=send_info_embed("Chua co nhat ky Thien Dao nao."), ephemeral=True)
         return
 
     lines = []
@@ -1477,9 +1598,809 @@ async def admin_logs_view(interaction: discord.Interaction, limit: Optional[int]
             f"• **{admin_name}** → `{row['action']}` | user: `{row['target_user_id']}` | pet: `{row['target_pet_id']}` | {row['details']}"
         )
 
-    em = discord.Embed(title="📚 Nhật ký Thiên Đạo", description="\n".join(lines), color=0x5D6D7E)
-    em.set_footer(text="Chỉ hiển thị các thao tác gần nhất")
+    em = discord.Embed(title="📚 Nhat ky Thien Dao", description="\n".join(lines), color=0x5D6D7E)
+    em.set_footer(text="Chi hien thi cac thao tac gan nhat")
     await interaction.response.send_message(embed=em, ephemeral=True)
+
+
+# =========================
+# MO RONG HE THONG DOI HINH / GACHA / THA PET
+# =========================
+# Goi y nang cap tiep theo cho ban code hien tai:
+# 1) owner toi da 9 pet
+# 2) doi hinh toi da 3 pet: dame / tank / buff
+# 3) them lenh tha pet
+# 4) gacha doc tu bang pet_pool, co the cap nhat bang lenh Thien Dao
+# 5) co the gan avatar_url / image_url cho tung mau pet de render embed dep hon
+
+# Database mo rong de dung cho he thong moi.
+def init_extended_pet_system():
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pet_pool (
+            template_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            display_name TEXT NOT NULL,
+            species TEXT NOT NULL,
+            role TEXT NOT NULL,
+            rarity TEXT NOT NULL DEFAULT 'Thuong',
+            element TEXT NOT NULL DEFAULT 'Thuong',
+            base_hp INTEGER NOT NULL DEFAULT 100,
+            base_atk INTEGER NOT NULL DEFAULT 10,
+            base_defense INTEGER NOT NULL DEFAULT 10,
+            base_speed INTEGER NOT NULL DEFAULT 10,
+            skill_name TEXT,
+            skill_desc TEXT,
+            image_url TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_team (
+            owner_id INTEGER NOT NULL,
+            slot_no INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            PRIMARY KEY(owner_id, slot_no)
+        )
+        """
+    )
+    conn.commit()
+
+
+init_extended_pet_system()
+
+
+def count_user_pets(owner_id: int) -> int:
+    cur.execute("SELECT COUNT(*) AS total FROM pets WHERE owner_id = ?", (owner_id,))
+    return cur.fetchone()["total"]
+
+
+def get_team_pets(owner_id: int):
+    cur.execute(
+        """
+        SELECT ut.slot_no, ut.role, p.*
+        FROM user_team ut
+        JOIN pets p ON p.pet_id = ut.pet_id
+        WHERE ut.owner_id = ?
+        ORDER BY ut.slot_no
+        """,
+        (owner_id,),
+    )
+    return cur.fetchall()
+
+
+def seed_100_pet_templates_if_empty():
+    cur.execute("SELECT COUNT(*) AS total FROM pet_pool")
+    total = cur.fetchone()["total"]
+    if total > 0:
+        return
+
+    roles = ["dame", "tank", "buff"]
+    species_list = ["cho", "meo", "tho", "rong", "cao"]
+    rarities = ["Thuong", "Hiem", "Quy", "Su Thi", "Huyen Thoai"]
+    elements = ["Lua", "Nuoc", "Cay", "Dien", "Anh Sang", "Bong Toi"]
+
+    for i in range(1, 101):
+        role = random.choice(roles)
+        species = random.choice(species_list)
+        rarity = random.choices(
+            rarities,
+            weights=[50, 25, 15, 8, 2],
+            k=1,
+        )[0]
+        element = random.choice(elements)
+
+        if role == "dame":
+            hp = random.randint(85, 120)
+            atk = random.randint(18, 30)
+            defense = random.randint(6, 14)
+            speed = random.randint(12, 24)
+        elif role == "tank":
+            hp = random.randint(130, 190)
+            atk = random.randint(8, 18)
+            defense = random.randint(18, 30)
+            speed = random.randint(5, 14)
+        else:
+            hp = random.randint(90, 130)
+            atk = random.randint(10, 18)
+            defense = random.randint(10, 18)
+            speed = random.randint(10, 20)
+
+        name = f"Pet Mau {i:03d}"
+        code = f"PET_{i:03d}"
+        skill_name = {
+            "dame": "Don Sat Thuong",
+            "tank": "Khien Chong Do",
+            "buff": "Loi Chuc Tien Ho Tro",
+        }[role]
+        skill_desc = {
+            "dame": "+sat thuong cho doi hinh",
+            "tank": "+giap va hut sat thuong",
+            "buff": "+toc danh / hoi mau / tang noi luc",
+        }[role]
+
+        now = now_str()
+        cur.execute(
+            """
+            INSERT INTO pet_pool(
+                code, display_name, species, role, rarity, element,
+                base_hp, base_atk, base_defense, base_speed,
+                skill_name, skill_desc, image_url, is_active, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                code, name, species, role, rarity, element,
+                hp, atk, defense, speed,
+                skill_name, skill_desc, None, now, now,
+            ),
+        )
+    conn.commit()
+
+
+seed_100_pet_templates_if_empty()
+
+
+def summon_from_pool(owner_id: int, pet_name: Optional[str] = None):
+    if count_user_pets(owner_id) >= 9:
+        return None, "Ban da dat toi da 9 pet. Hay tha bot pet truoc khi quay them."
+
+    cur.execute("SELECT * FROM pet_pool WHERE is_active = 1 ORDER BY RANDOM() LIMIT 1")
+    template = cur.fetchone()
+    if not template:
+        return None, "Chua co pet nao trong pet_pool."
+
+    final_name = pet_name or template["display_name"]
+    gender = random.choice(["Duc", "Cai"])
+    now = now_str()
+
+    cur.execute(
+        """
+        INSERT INTO pets(
+            owner_id, name, species, gender, rarity, element,
+            level, exp, hp, atk, defense, speed,
+            hunger, mood, health, bond,
+            last_feed, last_decay, feed_streak,
+            breed_cd_until, mutated, generation,
+            parent_a, parent_b, is_active, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            owner_id,
+            final_name,
+            template["species"],
+            gender,
+            template["rarity"],
+            template["element"],
+            1,
+            0,
+            template["base_hp"],
+            template["base_atk"],
+            template["base_defense"],
+            template["base_speed"],
+            100,
+            100,
+            100,
+            0,
+            now,
+            now,
+            0,
+            None,
+            0,
+            1,
+            None,
+            None,
+            0,
+            now,
+        ),
+    )
+    pet_id = cur.lastrowid
+    conn.commit()
+    return {"pet_id": pet_id, "template": template}, None
+
+
+ROLE_LABELS = {
+    "dame": "⚔️ Dame",
+    "tank": "🛡️ Tank",
+    "buff": "✨ Buff",
+}
+
+ROLE_ORDER = {"dame": 1, "tank": 2, "buff": 3}
+
+
+def get_pet_role_from_template_like(pet) -> str:
+    hp = pet["hp"]
+    atk = pet["atk"]
+    defense = pet["defense"]
+    speed = pet["speed"]
+    if defense >= atk and hp >= 130:
+        return "tank"
+    if atk >= defense + 5:
+        return "dame"
+    return "buff"
+
+
+def render_stat_bar(current: int, maximum: int, length: int = 14, filled: str = "🟩", empty: str = "⬛") -> str:
+    maximum = max(1, maximum)
+    current = max(0, min(current, maximum))
+    filled_count = round((current / maximum) * length)
+    return filled * filled_count + empty * (length - filled_count)
+
+
+def team_pet_summary_line(pet, role: str) -> str:
+    return (
+        f"{ROLE_LABELS.get(role, role)} • **{pet['name']}**
+"
+        f"HP `{pet['health']}/100` {render_stat_bar(pet['health'], 100, 8)}
+"
+        f"ATK **{pet['atk']}** | DEF **{pet['defense']}** | SPD **{pet['speed']}**"
+    )
+
+
+def render_battle_board_embed(attacker_name: str, defender_name: str, left_team: list, right_team: list, title: str, note: str):
+    em = discord.Embed(title=title, description=note, color=0x2C3E50)
+
+    left_header = []
+    for p in left_team:
+        left_header.append(f"Lv.{p['level']} {p['name']} {ROLE_LABELS.get(p['role'], p['role'])}")
+    right_header = []
+    for p in right_team:
+        right_header.append(f"Lv.{p['level']} {p['name']} {ROLE_LABELS.get(p['role'], p['role'])}")
+
+    em.add_field(
+        name=f"🟦 Team {attacker_name}",
+        value="
+".join(left_header) if left_header else "Chua xep doi hinh",
+        inline=True,
+    )
+    em.add_field(
+        name=f"🟥 Team {defender_name}",
+        value="
+".join(right_header) if right_header else "Chua xep doi hinh",
+        inline=True,
+    )
+
+    max_rows = max(len(left_team), len(right_team), 1)
+    for i in range(max_rows):
+        lp = left_team[i] if i < len(left_team) else None
+        rp = right_team[i] if i < len(right_team) else None
+        left_value = team_pet_summary_line(lp, lp['role']) if lp else "-"
+        right_value = team_pet_summary_line(rp, rp['role']) if rp else "-"
+        em.add_field(name=f"Pet hang {i + 1} ben trai", value=left_value, inline=True)
+        em.add_field(name=f"Pet hang {i + 1} ben phai", value=right_value, inline=True)
+    return em
+
+
+def get_team_with_roles(owner_id: int):
+    cur.execute(
+        """
+        SELECT ut.slot_no, ut.role, p.*
+        FROM user_team ut
+        JOIN pets p ON p.pet_id = ut.pet_id
+        WHERE ut.owner_id = ?
+        ORDER BY ut.slot_no
+        """,
+        (owner_id,),
+    )
+    return cur.fetchall()
+
+
+def calc_team_power(team_rows) -> tuple[int, list[str]]:
+    total = 0
+    notes = []
+    has_dame = False
+    has_tank = False
+    has_buff = False
+
+    for row in team_rows:
+        base = calc_pet_power(row)
+        role = row["role"]
+        if role == "dame":
+            base = int(base * 1.15)
+            has_dame = True
+        elif role == "tank":
+            base = int(base * 1.12)
+            has_tank = True
+        elif role == "buff":
+            base = int(base * 1.08)
+            has_buff = True
+        total += base
+
+    if has_dame and has_tank and has_buff:
+        total = int(total * 1.18)
+        notes.append("Bo 3 Dame - Tank - Buff kich hoat cong huong +18%")
+    elif has_tank and has_buff:
+        total = int(total * 1.10)
+        notes.append("Tank + Buff kich hoat ho tro +10%")
+    elif has_dame and has_buff:
+        total = int(total * 1.10)
+        notes.append("Dame + Buff kich hoat sat thuong +10%")
+    elif has_dame and has_tank:
+        total = int(total * 1.08)
+        notes.append("Dame + Tank kich hoat tan cong - phong thu +8%")
+
+    return total, notes
+
+
+def build_battle_unit(row):
+    role = row["role"]
+    max_hp = max(1, row["hp"] * 4)
+    atk = row["atk"]
+    defense = row["defense"]
+    speed = row["speed"]
+
+    if role == "tank":
+        max_hp = int(max_hp * 1.35)
+        defense = int(defense * 1.2)
+    elif role == "dame":
+        atk = int(atk * 1.2)
+        speed = int(speed * 1.1)
+    elif role == "buff":
+        max_hp = int(max_hp * 1.1)
+        speed = int(speed * 1.05)
+
+    return {
+        "pet_id": row["pet_id"],
+        "name": row["name"],
+        "role": role,
+        "level": row["level"],
+        "max_hp": max_hp,
+        "hp": max_hp,
+        "atk": max(1, atk),
+        "defense": max(1, defense),
+        "speed": max(1, speed),
+        "alive": True,
+    }
+
+
+def choose_target(team_units):
+    living = [u for u in team_units if u["alive"]]
+    if not living:
+        return None
+    tanks = [u for u in living if u["role"] == "tank"]
+    if tanks:
+        return tanks[0]
+    return sorted(living, key=lambda x: (x["hp"], x["defense"]))[0]
+
+
+def render_unit_card(unit):
+    if not unit:
+        return "-"
+    state = "Song" if unit["alive"] else "Ha guc"
+    return (
+        f"{ROLE_LABELS.get(unit['role'], unit['role'])} • **{unit['name']}**
+"
+        f"HP: **{unit['hp']} / {unit['max_hp']}**
+"
+        f"{render_stat_bar(unit['hp'], unit['max_hp'], 10)}
+"
+        f"ATK **{unit['atk']}** | DEF **{unit['defense']}** | SPD **{unit['speed']}**
+"
+        f"Trang thai: **{state}**"
+    )
+
+
+def render_live_battle_embed(attacker_name: str, defender_name: str, left_units: list, right_units: list, title: str, logs: list[str]):
+    em = discord.Embed(title=title, description="Mo phong tran dau doi hinh 3v3", color=0x34495E)
+    em.add_field(name=f"🟦 {attacker_name}", value="Con song: **{}**".format(sum(1 for u in left_units if u['alive'])), inline=True)
+    em.add_field(name=f"🟥 {defender_name}", value="Con song: **{}**".format(sum(1 for u in right_units if u['alive'])), inline=True)
+
+    max_rows = max(len(left_units), len(right_units), 1)
+    for i in range(max_rows):
+        lu = left_units[i] if i < len(left_units) else None
+        ru = right_units[i] if i < len(right_units) else None
+        em.add_field(name=f"Ben trai #{i + 1}", value=render_unit_card(lu), inline=True)
+        em.add_field(name=f"Ben phai #{i + 1}", value=render_unit_card(ru), inline=True)
+
+    log_text = "
+".join(logs[-8:]) if logs else "Tran dau sap bat dau..."
+    em.add_field(name="📜 Nhat ky giao tranh", value=log_text, inline=False)
+    return em
+
+
+def simulate_team_battle(left_team_rows, right_team_rows):
+    left_units = [build_battle_unit(r) for r in left_team_rows]
+    right_units = [build_battle_unit(r) for r in right_team_rows]
+    logs = []
+    turn = 1
+
+    def apply_team_buffs(team_units, side_name):
+        living = [u for u in team_units if u["alive"]]
+        for u in living:
+            if u["role"] == "buff":
+                for mate in living:
+                    if mate["pet_id"] == u["pet_id"]:
+                        continue
+                    mate["atk"] = int(mate["atk"] * 1.08)
+                    mate["defense"] = int(mate["defense"] * 1.05)
+                logs.append(f"✨ {side_name}: {u['name']} kich hoat buff cho dong doi")
+
+    apply_team_buffs(left_units, "Ben trai")
+    apply_team_buffs(right_units, "Ben phai")
+
+    snapshots = []
+    snapshots.append((turn, [dict(u) for u in left_units], [dict(u) for u in right_units], list(logs)))
+
+    while any(u["alive"] for u in left_units) and any(u["alive"] for u in right_units) and turn <= 12:
+        action_order = sorted(
+            [u for u in left_units + right_units if u["alive"]],
+            key=lambda x: (x["speed"], x["level"], random.randint(0, 9)),
+            reverse=True,
+        )
+
+        logs.append(f"— Turn {turn} —")
+        for actor in action_order:
+            if not actor["alive"]:
+                continue
+
+            allies = left_units if actor in left_units else right_units
+            enemies = right_units if actor in left_units else left_units
+            if not any(e["alive"] for e in enemies):
+                break
+
+            if actor["role"] == "buff":
+                ally_targets = [a for a in allies if a["alive"] and a["pet_id"] != actor["pet_id"]]
+                low_hp = sorted(ally_targets, key=lambda x: x["hp"])[:1]
+                if low_hp:
+                    target = low_hp[0]
+                    heal = int(actor["atk"] * 1.2) + random.randint(8, 18)
+                    old_hp = target["hp"]
+                    target["hp"] = min(target["max_hp"], target["hp"] + heal)
+                    logs.append(f"✨ {actor['name']} hoi cho {target['name']} {target['hp'] - old_hp} HP")
+                    continue
+
+            target = choose_target(enemies)
+            if not target:
+                break
+
+            raw = actor["atk"] * random.uniform(0.9, 1.15)
+            if actor["role"] == "dame":
+                raw *= 1.15
+            if target["role"] == "tank":
+                raw *= 0.9
+            damage = max(1, int(raw - (target["defense"] * random.uniform(0.45, 0.8))))
+
+            if actor["role"] == "tank":
+                damage = int(damage * 0.9)
+
+            target["hp"] = max(0, target["hp"] - damage)
+            logs.append(f"⚔️ {actor['name']} tan cong {target['name']} gay **{damage}** sat thuong")
+            if target["hp"] <= 0:
+                target["alive"] = False
+                logs.append(f"💥 {target['name']} da bi ha guc")
+
+        snapshots.append((turn, [dict(u) for u in left_units], [dict(u) for u in right_units], list(logs)))
+        turn += 1
+
+    left_alive = sum(1 for u in left_units if u["alive"])
+    right_alive = sum(1 for u in right_units if u["alive"])
+
+    if left_alive > right_alive:
+        winner_side = "left"
+    elif right_alive > left_alive:
+        winner_side = "right"
+    else:
+        left_hp_total = sum(u["hp"] for u in left_units)
+        right_hp_total = sum(u["hp"] for u in right_units)
+        winner_side = "left" if left_hp_total >= right_hp_total else "right"
+
+    return {
+        "winner_side": winner_side,
+        "left_units": left_units,
+        "right_units": right_units,
+        "logs": logs,
+        "snapshots": snapshots,
+    }
+
+
+class PkConfirmView(discord.ui.View):
+    def __init__(self, challenger_id: int, target_id: int):
+        super().__init__(timeout=60)
+        self.challenger_id = challenger_id
+        self.target_id = target_id
+        self.accepted = False
+
+    @discord.ui.button(label="Chap nhan PK", style=discord.ButtonStyle.success)
+    async def accept_pk(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.target_id:
+            await interaction.response.send_message("Ban khong phai nguoi duoc moi PK.", ephemeral=True)
+            return
+        self.accepted = True
+        self.disable_all_items()
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(label="Tu choi", style=discord.ButtonStyle.danger)
+    async def reject_pk(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.target_id:
+            await interaction.response.send_message("Ban khong phai nguoi duoc moi PK.", ephemeral=True)
+            return
+        self.accepted = False
+        self.disable_all_items()
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    async def on_timeout(self):
+        self.disable_all_items()
+
+
+@bot.tree.command(name="thapet", description="Tha bot 1 pet de giai phong o trong")
+async def thapet(interaction: discord.Interaction, pet_id: int):
+    cur.execute("SELECT * FROM pets WHERE owner_id = ? AND pet_id = ?", (interaction.user.id, pet_id))
+    pet = cur.fetchone()
+    if not pet:
+        await interaction.response.send_message(embed=send_error_embed("Khong tim thay pet de tha."), ephemeral=True)
+        return
+
+    cur.execute("DELETE FROM user_team WHERE owner_id = ? AND pet_id = ?", (interaction.user.id, pet_id))
+    cur.execute("DELETE FROM pets WHERE owner_id = ? AND pet_id = ?", (interaction.user.id, pet_id))
+    conn.commit()
+    await interaction.response.send_message(embed=send_success_embed(f"Da tha pet **{pet['name']}** ve tu nhien."))
+
+
+@bot.tree.command(name="quaypet", description="Quay ngau nhien 1 pet tu kho 100 pet")
+async def quaypet(interaction: discord.Interaction):
+    result, err = summon_from_pool(interaction.user.id)
+    if err:
+        await interaction.response.send_message(embed=send_error_embed(err), ephemeral=True)
+        return
+
+    template = result["template"]
+    pet_id = result["pet_id"]
+    em = discord.Embed(
+        title="🎰 Quay pet thanh cong",
+        description=(
+            f"🐾 Ban vua nhan duoc **{template['display_name']}**
+"
+            f"ID pet: **{pet_id}**
+"
+            f"Vai tro: **{ROLE_LABELS.get(template['role'], template['role'])}**
+"
+            f"Pham chat: **{template['rarity']}**
+"
+            f"He: **{template['element']}**"
+        ),
+        color=0x8E44AD,
+    )
+    em.add_field(
+        name="📊 Chi so goc",
+        value=(
+            f"HP: **{template['base_hp']}**
+"
+            f"ATK: **{template['base_atk']}**
+"
+            f"DEF: **{template['base_defense']}**
+"
+            f"SPD: **{template['base_speed']}**"
+        ),
+        inline=True,
+    )
+    em.add_field(
+        name="✨ Ky nang",
+        value=f"**{template['skill_name'] or 'Chua dat ten'}**
+{template['skill_desc'] or 'Chua co mo ta'}",
+        inline=True,
+    )
+    if template["image_url"]:
+        em.set_thumbnail(url=template["image_url"])
+    await interaction.response.send_message(embed=em)
+
+
+@app_commands.choices(
+    role=[
+        app_commands.Choice(name="Dame", value="dame"),
+        app_commands.Choice(name="Tank", value="tank"),
+        app_commands.Choice(name="Buff", value="buff"),
+    ]
+)
+@bot.tree.command(name="xepdoi", description="Xep 1 pet vao doi hinh dame tank buff")
+async def xepdoi(interaction: discord.Interaction, role: app_commands.Choice[str], pet_id: int):
+    cur.execute("SELECT * FROM pets WHERE owner_id = ? AND pet_id = ?", (interaction.user.id, pet_id))
+    pet = cur.fetchone()
+    if not pet:
+        await interaction.response.send_message(embed=send_error_embed("Khong tim thay pet nay."), ephemeral=True)
+        return
+
+    slot_map = {"dame": 1, "tank": 2, "buff": 3}
+    slot_no = slot_map[role.value]
+
+    cur.execute(
+        """
+        INSERT INTO user_team(owner_id, slot_no, pet_id, role)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(owner_id, slot_no)
+        DO UPDATE SET pet_id = excluded.pet_id, role = excluded.role
+        """,
+        (interaction.user.id, slot_no, pet_id, role.value),
+    )
+    conn.commit()
+    await interaction.response.send_message(embed=send_success_embed(f"Da xep **{pet['name']}** vao o **{ROLE_LABELS[role.value]}**."))
+
+
+@bot.tree.command(name="doihinh", description="Xem doi hinh 3 pet hien tai")
+async def doihinh(interaction: discord.Interaction):
+    rows = get_team_pets(interaction.user.id)
+    if not rows:
+        await interaction.response.send_message(embed=send_info_embed("Ban chua xep doi hinh nao. Dung `/xepdoi` de xep Dame / Tank / Buff."), ephemeral=True)
+        return
+
+    em = discord.Embed(
+        title=f"🧩 Doi hinh cua {interaction.user.display_name}",
+        description="Toi da 3 pet chien dau: 1 Dame • 1 Tank • 1 Buff",
+        color=0x3498DB,
+    )
+    for row in rows:
+        em.add_field(
+            name=f"{ROLE_LABELS.get(row['role'], row['role'])} • {row['name']}",
+            value=(
+                f"Pet ID: **{row['pet_id']}**
+"
+                f"Loai: **{species_name_vi(row['species'])}**
+"
+                f"Lv: **{row['level']}** • Power: **{calc_pet_power(row)}**
+"
+                f"HP view: `{row['health']}/100` {render_stat_bar(row['health'], 100, 8)}"
+            ),
+            inline=False,
+        )
+    await interaction.response.send_message(embed=em)
+
+
+@bot.tree.command(name="pkdoihinh", description="Moi 1 nguoi choi PK va doi xac nhan")
+async def pkdoihinh(interaction: discord.Interaction, user: discord.Member):
+    if user.bot:
+        await interaction.response.send_message(embed=send_error_embed("Khong the PK voi bot."), ephemeral=True)
+        return
+    if user.id == interaction.user.id:
+        await interaction.response.send_message(embed=send_error_embed("Khong the PK voi chinh minh."), ephemeral=True)
+        return
+
+    my_team = get_team_with_roles(interaction.user.id)
+    enemy_team = get_team_with_roles(user.id)
+
+    if not my_team:
+        await interaction.response.send_message(embed=send_error_embed("Ban chua co doi hinh PK. Dung `/xepdoi` truoc."), ephemeral=True)
+        return
+    if not enemy_team:
+        await interaction.response.send_message(embed=send_error_embed("Doi thu chua co doi hinh PK."), ephemeral=True)
+        return
+
+    invite_view = PkConfirmView(interaction.user.id, user.id)
+    preview = render_battle_board_embed(
+        interaction.user.display_name,
+        user.display_name,
+        my_team,
+        enemy_team,
+        "⚔️ Loi moi PK doi hinh",
+        f"{user.mention}, ban co muon chap nhan tran dau voi {interaction.user.mention} khong?",
+    )
+    preview.set_footer(text="Nhan Chap nhan PK de bat dau tran dau")
+    await interaction.response.send_message(content=user.mention, embed=preview, view=invite_view)
+
+    await invite_view.wait()
+    if not invite_view.accepted:
+        try:
+            reject_embed = discord.Embed(
+                title="🚫 Loi moi PK ket thuc",
+                description=f"{user.mention} da tu choi hoac khong phan hoi loi moi PK.",
+                color=0xE74C3C,
+            )
+            await interaction.edit_original_response(embed=reject_embed, view=invite_view)
+        except Exception:
+            pass
+        return
+
+    my_team = get_team_with_roles(interaction.user.id)
+    enemy_team = get_team_with_roles(user.id)
+    if not my_team or not enemy_team:
+        await interaction.edit_original_response(
+            embed=send_error_embed("Mot trong hai ben vua thay doi doi hinh, vui long PK lai."),
+            view=None,
+        )
+        return
+
+    battle = simulate_team_battle(my_team, enemy_team)
+    for turn_no, left_state, right_state, log_state in battle["snapshots"]:
+        live_embed = render_live_battle_embed(
+            interaction.user.display_name,
+            user.display_name,
+            left_state,
+            right_state,
+            f"🎬 Tran dau dang dien ra • Turn {turn_no}",
+            log_state,
+        )
+        await interaction.edit_original_response(embed=live_embed, view=None)
+        await asyncio.sleep(1.0)
+
+    winner = interaction.user if battle["winner_side"] == "left" else user
+    loser = user if winner.id == interaction.user.id else interaction.user
+    winner_team_rows = my_team if winner.id == interaction.user.id else enemy_team
+
+    get_user(interaction.user.id)
+    get_user(user.id)
+    cur.execute("SELECT coins FROM users WHERE user_id = ?", (interaction.user.id,))
+    my_coins = cur.fetchone()["coins"]
+    cur.execute("SELECT coins FROM users WHERE user_id = ?", (user.id,))
+    enemy_coins = cur.fetchone()["coins"]
+    stake = min(300, my_coins, enemy_coins)
+
+    if stake > 0:
+        cur.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (stake, winner.id))
+        cur.execute("UPDATE users SET coins = MAX(0, coins - ?) WHERE user_id = ?", (stake, loser.id))
+
+    for row in winner_team_rows:
+        pet_gain_exp(row["pet_id"], 12)
+    user_gain_exp(winner.id, 10)
+    cur.execute(
+        "INSERT INTO battles(attacker_id, defender_id, winner_id, coins_delta, created_at) VALUES (?, ?, ?, ?, ?)",
+        (interaction.user.id, user.id, winner.id, stake, now_str()),
+    )
+    conn.commit()
+
+    result_embed = render_live_battle_embed(
+        interaction.user.display_name,
+        user.display_name,
+        battle["left_units"],
+        battle["right_units"],
+        "🏆 Ket qua PK doi hinh",
+        battle["logs"],
+    )
+    result_embed.add_field(name="👑 Nguoi thang", value=winner.mention, inline=False)
+    result_embed.add_field(name="🎁 Thuong xu", value=f"**{stake} xu**" if stake > 0 else "Hai ben khong du xu de dat cuoc", inline=False)
+    result_embed.set_footer(text="Tran dau nay can xac nhan truoc moi bat dau")
+    await interaction.edit_original_response(embed=result_embed, view=None)
+
+
+@app_commands.choices(
+    role=[
+        app_commands.Choice(name="Dame", value="dame"),
+        app_commands.Choice(name="Tank", value="tank"),
+        app_commands.Choice(name="Buff", value="buff"),
+    ]
+)
+@bot.tree.command(name="themtemplatepet", description="[Thien Dao] Them pet moi vao kho gacha")
+async def themtemplatepet(
+    interaction: discord.Interaction,
+    code: str,
+    display_name: str,
+    species: str,
+    role: app_commands.Choice[str],
+    rarity: str,
+    element: str,
+    base_hp: int,
+    base_atk: int,
+    base_defense: int,
+    base_speed: int,
+    skill_name: Optional[str] = None,
+    skill_desc: Optional[str] = None,
+    image_url: Optional[str] = None,
+):
+    if not require_thien_dao(interaction):
+        await interaction.response.send_message(embed=send_error_embed("Ban khong co quyen Thien Dao."), ephemeral=True)
+        return
+
+    now = now_str()
+    cur.execute(
+        """
+        INSERT INTO pet_pool(
+            code, display_name, species, role, rarity, element,
+            base_hp, base_atk, base_defense, base_speed,
+            skill_name, skill_desc, image_url, is_active, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        """,
+        (
+            code.upper(), display_name, species, role.value, rarity, element,
+            base_hp, base_atk, base_defense, base_speed,
+            skill_name, skill_desc, image_url, now, now,
+        ),
+    )
+    conn.commit()
+    await interaction.response.send_message(embed=send_success_embed(f"Da them template pet **{display_name}** vao kho gacha."))
 
 
 # =========================
